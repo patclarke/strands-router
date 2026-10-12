@@ -125,7 +125,12 @@ In order of precedence:
 
 1. `STRANDS_BASELINE_MODEL` — an exact model id (`claude-opus-5-5`) or a tier (`opus`, `sonnet`).
 2. For Claude, the default model saved in `~/.claude/settings.json` before the session started.
-3. The strong tier (Opus / `gpt-5.6-sol`) — what both launchers start a routed session on.
+3. The strong tier (Opus / `gpt-5.6-sol`).
+
+A Claude session **starts on the baseline model** and the decider moves it from there, so every
+dollar in the ledger comes from a routing decision rather than from where routing happened to
+begin. If your saved default is Fable, the long tier is enabled automatically so routing can stay
+on Fable for big tasks (set `STRANDS_ALLOW_FABLE=0` to cap at Opus instead).
 
 Requests where you picked a model yourself, and Claude Code's own background calls (titles,
 summaries), are recorded with zero savings: routing didn't touch them, but they're part of what
@@ -276,7 +281,7 @@ Set in the environment, a `.env` in the launch directory, or `~/.strands-router.
 | `STRANDS_BASELINE_MODEL` | Both | Model (or tier) savings are measured against. |
 | `STRANDS_HOME` | Both | Ledger, pricing overrides, venv, logs; default `~/.strands-router`. |
 | `STRANDS_DISABLE` | Both | `1` launches the CLI with no proxy at all. |
-| `STRANDS_ALLOW_FABLE` | Both | Enables the opt-in long tier. |
+| `STRANDS_ALLOW_FABLE` | Both | `1` enables the opt-in long tier; on by default when your saved Claude default is Fable. |
 | `STRANDS_DEBUG` | Both | Logs decisions, rewrites and per-response costs to `~/.strands-router.log`. |
 | `STRANDS_DUMP` | Both | Dumps request bodies for debugging wire-format changes. |
 | `STRANDS_NO_STATUSLINE` | Claude | Disables the injected status line. |

@@ -163,7 +163,7 @@ test("a routed request without metadata is recorded under the conversation key",
 
   const { port, close } = await startProxy({
     upstreamURL: `http://127.0.0.1:${upstream.address().port}`,
-    route: async () => ({ choice: "claude-sonnet-5", confidence: 0.77, ms: 1 }),
+    route: async () => ({ choice: "claude-sonnet-5-5", confidence: 0.77, ms: 1 }),
   });
   t.after(close);
 
@@ -278,7 +278,7 @@ test("routing to haiku strips fields haiku cannot accept", () => {
     context_management: { edits: [{ type: "clear_thinking_20251015", keep: "all" }] },
   };
   applyTier(body, "haiku");
-  assert.equal(body.model, "claude-haiku-4-5-20251001");
+  assert.equal(body.model, "claude-haiku-5-5");
   assert.equal(body.thinking, undefined);
   assert.equal(body.output_config, undefined);
   assert.equal(body.context_management, undefined);
@@ -300,7 +300,7 @@ test("routing to opus leaves thinking and effort intact", () => {
     output_config: { effort: "medium" },
   };
   applyTier(body, "opus");
-  assert.equal(body.model, "claude-opus-5");
+  assert.equal(body.model, "claude-opus-5-5");
   assert.deepEqual(body.thinking, { type: "adaptive" });
   assert.deepEqual(body.output_config, { effort: "medium" });
 });
@@ -359,4 +359,88 @@ test("the same opening text in two sessions gets two keys", () => {
 test("the key survives metadata that is not JSON", () => {
   const body = { metadata: { user_id: "not-json" }, messages: [{ role: "user", content: "hi" }] };
   assert.doesNotThrow(() => conversationKey(body));
+});
+
+test("a trailing mid-conversation system message does not hide the user's turn", () => {
+  // Claude Code 2.1.274 appends a role:"system" message after the prompt.
+  const body = withTools([
+    { role: "user", content: [{ type: "text", text: "What's the typo in 'recieve'?" }] },
+    { role: "system", content: [{ type: "text", text: "<system-reminder>context</system-reminder>" }] },
+  ]);
+  assert.equal(newTurnPrompt(body), "What's the typo in 'recieve'?");
+});
+
+test("a tool result followed by a system message is still a continuation", () => {
+  const body = withTools([
+    { role: "user", content: "go" },
+    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
+    { role: "system", content: "reminder" },
+  ]);
+  assert.equal(newTurnPrompt(body), null);
+});
+
+test("a routed session starts on the user's saved default, so only decisions count as savings", async (t) => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      seen.push(JSON.parse(Buffer.concat(chunks)));
+      res.setHeader("content-type", "application/json");
+      res.end('{"id":"msg_1","type":"message","model":"claude-sonnet-5-5"}');
+    });
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => upstream.close());
+  let asked;
+  const { port, close } = await startProxy({
+    upstreamURL: `http://127.0.0.1:${upstream.address().port}`,
+    baselineModel: "sonnet",
+    record: () => {},
+    route: async (input) => {
+      asked = input;
+      return null; // decider down: the session must stay on its starting model
+    },
+  });
+  t.after(close);
+  await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "strands-router",
+      ...withTools([{ role: "user", content: `explain this ${process.pid}` }]),
+    }),
+  });
+  assert.equal(asked.current, "claude-sonnet-5-5", "the decider is told the session is on the user's default");
+  assert.equal(seen[0].model, "claude-sonnet-5-5");
+});
+
+test("an exact saved default is the model a session starts on, with any [1m] alias dropped", async (t) => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      seen.push(JSON.parse(Buffer.concat(chunks)));
+      res.setHeader("content-type", "application/json");
+      res.end('{"id":"msg_1","type":"message"}');
+    });
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => upstream.close());
+  const { port, close } = await startProxy({
+    upstreamURL: `http://127.0.0.1:${upstream.address().port}`,
+    baselineModel: "claude-opus-4-6[1m]",
+    record: () => {},
+    route: async () => null,
+  });
+  t.after(close);
+  // A request with no new turn (no tools) still has to resolve the sentinel to a real model.
+  await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "strands-router", messages: [{ role: "user", content: `title ${process.pid}` }] }),
+  });
+  assert.equal(seen[0].model, "claude-opus-4-6");
 });
