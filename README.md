@@ -29,6 +29,29 @@ description to be a **string**, while jev-router sent objects. This fork flatten
 request it builds has been validated against Decider's own pydantic schema
 (`strands_decider/schema.py`), and `test/router.test.mjs` pins that shape.
 
+## Strands Decider, Jev and Clef
+
+Jev (TypeSafe), Clef (Cloudflare) and Strands Decider are the same kind of model: a decision model
+behind the System One API. You send it a prompt and a question ("fast, balanced or strong?") and
+get back a typed answer with a confidence. None of them intercepts traffic; that is this router's
+job. So which apps can be routed is the same whichever decider you use (see
+[Limitations](#limitations)). What differs is where the decider runs:
+
+| | Strands Decider (default here) | Jev | Clef / Clef-flash |
+| --- | --- | --- | --- |
+| Runs | Locally on your Mac | TypeSafe's cloud | Cloudflare Workers AI, or downloadable |
+| Size | 2B | not published | 27B / 9B |
+| Your prompt leaves your machine | No | Yes | Yes, when hosted |
+| Cost | Free | Paid API | Workers AI pricing |
+| Speed | ~0.5 s per decision, measured on an Apple-silicon Mac | ~0.3 s reported | ~209 ms / ~39 ms reported |
+
+Jev and Clef figures are the vendors' own, from launch coverage
+([The New Stack](https://thenewstack.io/typesafe-jev-system-one/),
+[eesel on Clef](https://www.eesel.ai/blog/cloudflare-clef)); they have not been verified with this
+router. Clef is described as following the System One API, so pointing `STRANDS_DECIDER_URL` at it
+should be close to enough. But hosted deciders need an API key on each request, and the router
+does not send one yet, because the local server doesn't need it.
+
 ## Quick start (macOS, Apple silicon)
 
 Requires Node.js 20.12+, Python 3.10+ (`brew install python@3.12`), and
@@ -99,28 +122,58 @@ Every billed response that passes through the proxy is read for its token usage 
 One JSON line per response is appended to `~/.strands-router/usage.jsonl` (mode 600). It holds
 model ids, token counts and dollars only — never prompt or response text.
 
+Options: `--since 24h|7d|30d|4w|today|all`, `--session <id>`, `--json`. The Claude status line
+shows the running total for the current session, in this form:
+
 ```text
-$ strands-savings --since 7d
+claude-haiku-5-5 (p=0.91) · saved $0.36 (75%) · my-project · 12% context
+```
+
+### A real example
+
+One question asked through the router on an Apple-silicon Mac, with Fable 5.1 as the saved
+Claude Code default:
+
+```text
+$ STRANDS_DEBUG=1 strands-claude -p "What's the typo in the word 'recieve'? One line."
+The typo is the transposed "ei"; it should be "receive" (i before e, except after c).
+
+$ tail -4 ~/.strands-router.log
+[strands] 6c4491f962e9 1853ms p=0.91 fable -> haiku (decider) ctx~8803 | What's the typo in the word 'recieve'? One line.
+[strands] 6c4491f962e9 rewrite strands-router -> claude-haiku-5-5
+[strands] 200 served by claude-haiku-5-5
+[strands] usage claude-haiku-5-5 in=2 cw=151923 cr=0 out=129 $0.1522 vs claude-fable-5-1 $3.0449
+
+$ strands-savings
 Strands Router savings
 
-  Without routing (baseline)       $41.2210
-  With routing (actual)            $17.0384
-  Saved                            $24.1826  (58.7%)
+  Without routing (baseline)       $6.0851
+  With routing (actual)            $3.1924
+  Saved                            $2.8927  (47.5%)
 
-  212 routed turns: 131 to a cheaper model, 4 to a pricier one, 77 unchanged
-  ...
+  2 routed turns: 1 to a cheaper model, 0 to a pricier one, 1 unchanged
+  2 billed responses (2 routed), tokens: 4 in, 303.9k cache write, 0 cache read, 160 out
+
   Served by                      Responses      Actual    Baseline       Saved
-  claude-opus-5-5                      390    $12.1100    $12.1100     $0.0000
-  claude-haiku-4-5                     544     $3.9210    $23.6100    $19.6890
-  claude-sonnet-5-5                    201     $1.0074     $5.5010     $4.4936
+  claude-fable-5-1                       1     $3.0402     $3.0402     $0.0000
+  claude-haiku-5-5                       1     $0.1522     $3.0449     $2.8927
 ```
 
-(Illustrative output.) Options: `--since 24h|7d|30d|4w|today|all`, `--session <id>`, `--json`.
-The Claude status line shows the running total for the current session:
+How to read it:
 
-```text
-claude-haiku-4-5 (p=0.91) · saved $0.36 (75%) · my-project · 12% context
-```
+- **The decision.** The session started on the saved default (Fable). The decider rated the prompt
+  `fast` with 0.91 confidence in 1.9 s, so the turn was served by Haiku 5.5.
+- **The other row.** The Fable row is an earlier run of the same question, made before the
+  keep-warm fix: the decider timed out, so the turn stayed on Fable and saved nothing.
+- **Why one short question costs ~$3 on Fable.** 129 output tokens are the answer. The rest is the
+  ~152k tokens of context Claude Code sends with every request (its system prompt plus, here, 156
+  tool definitions), written to the prompt cache at the 1-hour rate (2x input). On Fable that is
+  151,923 × $20/M = $3.04. The same write on Haiku 5.5 is billed at its above-100k-token rate,
+  151,923 × $1/M = $0.15.
+- **Don't read the 95% saving on this turn as typical.** Each `claude -p` call is a fresh session
+  that pays that write once. If Fable's cache had already been warm from earlier use, staying on
+  Fable would have cost about $0.04 (cache reads at $0.25/M), and routing this turn to Haiku would
+  have cost about $0.11 *more*. See the cache caveat below.
 
 ### What the baseline is
 
@@ -147,11 +200,13 @@ the session cost.
 - **Same tokens, different model.** A different model would have produced a different number of
   output tokens, and tokenizers differ between model generations. The baseline assumes the same
   usage, which is the standard simplification but not exact.
-- **Cache effects.** Switching models invalidates the prompt cache, so a downgrade can cause cache
-  *writes* the baseline would have served as cheaper cache *reads*. The router already refuses
-  downgrades once a conversation is large (`downgradeMaxContextTokens`), and the extra writes are
-  included in the actual cost — but the baseline prices those same writes at the baseline model's
-  rate rather than as reads, so savings on a turn that switched models are somewhat overstated.
+- **Cache effects — the biggest caveat.** The prompt cache belongs to one model, so switching models
+  means re-writing the whole context on the new one. The baseline assumes the baseline model would
+  have paid that same write. If its cache was already warm, it would have paid for cheap cache
+  *reads* instead, and a switch can then cost more than it saves (the example above flips from
+  $2.89 saved to $0.11 lost). With Claude Code's large context this effect dominates short sessions,
+  so treat the saved figure as an upper bound for now. The router does refuse downgrades once a
+  conversation is large (`downgradeMaxContextTokens`).
 - **Prices drift.** Rates live in `src/pricing.mjs` (Anthropic list prices as of October 2026;
   OpenAI rates as community-reported, with sources disagreeing on `gpt-5.6-sol`). Override or add
   any model in `~/.strands-router/pricing.json`:
@@ -304,7 +359,29 @@ node bin/strands-claude.mjs -p "what is 2+2?"
 
 ## Limitations
 
+### Which apps can be routed
+
+The router is a local proxy that a tool has to be pointed at. It cannot see traffic from apps that
+talk to their vendor's own backend.
+
+| App | Routed? |
+| --- | --- |
+| Claude Code CLI, via `strands-claude` | Yes |
+| OpenAI Codex CLI, via `strands-codex` | Yes |
+| Claude Code in VS Code or JetBrains | Not yet. Possible in principle via `ANTHROPIC_BASE_URL` (VS Code: `claudeCode.environmentVariables`), but that needs an always-on router, which doesn't exist yet. |
+| Claude Desktop, **Code** tab | Unknown. Its docs say it ignores `ANTHROPIC_BASE_URL` and uses its own gateway setting (Developer Mode → Configure Third-Party Inference). Whether that works with a subscription login is untested. |
+| Claude Desktop **chat**, claude.ai, ChatGPT | No. They talk to their vendor's own backend, with no supported way to point them elsewhere. Chat on a subscription isn't billed per token anyway. |
+
+This is the same whichever decider is used (Strands Decider, Jev or Clef).
+
+### Other limitations
+
 - Only Apple silicon Macs are practical: current PyTorch has no Intel-Mac wheels.
+- The keep-warm ping runs a tiny question every 20 s while the decider is idle, which costs a
+  little GPU time and battery. Set `STRANDS_DECIDER_KEEPWARM=0` to turn it off, at the cost of
+  11–14 s cold decisions after a few idle minutes (routing then times out and keeps the model).
+- Claude Code prints `[claude-code:unrecognized_model] {"model":"strands-router",...}` because the
+  router's sentinel model id isn't one it knows. It's harmless.
 - Decider adds latency to the first request of a turn only; tool-loop continuations add none.
 - To read usage, the proxy asks the API for uncompressed responses on billed requests.
 - Claude Code and Codex request formats are not public contracts. Use `STRANDS_DUMP` to diagnose
