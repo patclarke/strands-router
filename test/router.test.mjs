@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { askDecider, deciderHealth, systemOne } from "../src/router.mjs";
+import { askDecider, buildRequest, deciderHealth, systemOne } from "../src/router.mjs";
 import { questionForModels, describeOption } from "../src/config.mjs";
 
 const MODELS = [
@@ -86,6 +86,8 @@ test("asks the local Decider and maps its answer onto a routing choice", async (
     current: "claude-opus-5-5",
     contextTokens: 1000,
     models: MODELS,
+    style: "detailed",
+    metrics: true,
     send: (request, options) => systemOne(request, { ...options, url: decider.url }),
   });
   assert.equal(answer.choice, "claude-haiku-4-5");
@@ -122,4 +124,34 @@ test("routing fails open when no Decider is listening", async () => {
 test("health reports the served checkpoint", async (t) => {
   const decider = await fakeDecider(t);
   assert.equal((await deciderHealth({ url: decider.url })).model, "strands-decider-2B-hobson-v19");
+});
+
+test("the compact question asks over the bare prompt and maps its answer to an exact model", async () => {
+  const request = buildRequest({ prompt: "fix the typo", current: "claude-opus-5-5", contextTokens: 0, models: MODELS, style: "compact", metrics: false });
+  assert.equal(request.state, "fix the typo");
+  assert.deepEqual(Object.keys(request.questions), ["model"]);
+  assert.deepEqual(Object.keys(request.questions.model.criteria), ["fast", "balanced", "strong"]);
+
+  const answer = await askDecider({
+    prompt: "fix the typo",
+    current: "claude-opus-5-5",
+    contextTokens: 0,
+    models: MODELS,
+    style: "compact",
+    metrics: false,
+    send: async () => ({
+      answers: {
+        model: { type: "choice", choice: "fast", probabilities: { fast: 0.9, balanced: 0.07, strong: 0.03 }, confidence: 0.85 },
+      },
+    }),
+  });
+  assert.equal(answer.choice, "claude-haiku-4-5");
+  assert.deepEqual(answer.probabilities, { "claude-haiku-4-5": 0.9, "claude-sonnet-5-5": 0.07, "claude-opus-5-5": 0.03 });
+  assert.equal(answer.metrics.taskComplexity, null, "no scores were asked for");
+});
+
+test("the detailed style and the complexity scores remain available", () => {
+  const request = buildRequest({ prompt: "x", current: "claude-opus-5-5", contextTokens: 5, models: MODELS, style: "detailed", metrics: true });
+  assert.equal(request.state.session.context_tokens, 5);
+  assert.deepEqual(Object.keys(request.questions), ["task_complexity", "reasoning_required", "tool_complexity", "model"]);
 });

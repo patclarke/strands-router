@@ -49,8 +49,10 @@ cmd_install() {
   echo "decider: the first 'serve' downloads the $CHECKPOINT weights from Hugging Face (a few GB)."
 }
 
+# The full server command. serve_decider.py wraps the stock `strands-decider serve` app so all
+# model work stays on one thread (the stock server segfaulted on a Mac) and warms up first.
 serve_args() {
-  local args=(serve "$CHECKPOINT" --host 127.0.0.1 --port "$PORT")
+  local args=("$VENV/bin/python" "$HERE/serve_decider.py" "$CHECKPOINT" --host 127.0.0.1 --port "$PORT")
   [[ -n "$DEVICE" ]] && args+=(--device "$DEVICE")
   [[ "$PREFIX_CACHE" == "0" ]] && args+=(--no-prefix-cache)
   printf '%s\n' "${args[@]}"
@@ -64,7 +66,7 @@ cmd_serve() {
   export PYTHONFAULTHANDLER=1
   local args=()
   while IFS= read -r arg; do args+=("$arg"); done < <(serve_args)  # bash 3.2 has no mapfile
-  exec "$VENV/bin/strands-decider" "${args[@]}"
+  exec "${args[@]}"
 }
 
 cmd_check() {
@@ -82,6 +84,7 @@ cmd_autostart() {
   mkdir -p "$(dirname "$PLIST")" "$HOME_DIR/logs"
   local program_args=""
   while IFS= read -r arg; do program_args+="    <string>$arg</string>"$'\n'; done < <(serve_args)
+  echo "decider: the launchd job runs scripts from $HERE; re-run autostart if you move the repo."
   cat >"$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -90,7 +93,6 @@ cmd_autostart() {
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$VENV/bin/strands-decider</string>
 $program_args  </array>
   <key>EnvironmentVariables</key>
   <dict>
