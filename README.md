@@ -264,7 +264,7 @@ and `STRANDS_DECIDER_DEVICE`.
 
 ```bash
 npm test                         # no dependencies to install
-node test/live-routing.mjs       # needs a running decider
+node scripts/live-routing.mjs       # needs a running decider
 node bin/strands-claude.mjs -p "what is 2+2?"
 ```
 

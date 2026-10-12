@@ -1,5 +1,5 @@
 // Asks a running Strands Decider (`scripts/decider.sh serve`) to route a few sample prompts.
-// Not part of `npm test`: it needs the real model. Usage: node test/live-routing.mjs
+// Not part of `npm test`: it needs the real model. Usage: node scripts/live-routing.mjs
 try {
   process.loadEnvFile();
 } catch {

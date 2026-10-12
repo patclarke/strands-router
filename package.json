@@ -16,7 +16,7 @@
     "strands-savings": "bin/strands-savings.mjs"
   },
   "scripts": {
-    "test": "node --test \"test/**/*.test.mjs\"",
+    "test": "node --test",
     "prepublishOnly": "npm test"
   },
   "files": [
