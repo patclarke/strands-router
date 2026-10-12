@@ -2,15 +2,17 @@ import http from "node:http";
 import https from "node:https";
 import { createHash, randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
-import { availableTiers, shouldUseExactModel } from "./config.mjs";
-import { askJev } from "./router.mjs";
+import { TIER_NAMES, availableTiers, deciderURL, rankOf, shouldUseExactModel } from "./config.mjs";
+import { directionOf, resolveBaseline, trackResponse } from "./accounting.mjs";
+import { appendEntry } from "./ledger.mjs";
+import { askDecider } from "./router.mjs";
 import { decide } from "./policy.mjs";
 import { log } from "./log.mjs";
 import { writeDecision, writeStatus } from "./status.mjs";
 
 const CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const API_BASE_URL = "https://api.openai.com/v1";
-export const CODEX_AUTO_MODEL = "jev-router";
+export const CODEX_AUTO_MODEL = "strands-router";
 const DEFAULT_MODELS = {
   haiku: "gpt-5.6-luna",
   sonnet: "gpt-5.6-terra",
@@ -18,10 +20,10 @@ const DEFAULT_MODELS = {
   fable: "gpt-6-astra",
 };
 const MODEL_ENV = {
-  haiku: "JEV_CODEX_FAST_MODEL",
-  sonnet: "JEV_CODEX_BALANCED_MODEL",
-  opus: "JEV_CODEX_STRONG_MODEL",
-  fable: "JEV_CODEX_LONG_MODEL",
+  haiku: "STRANDS_CODEX_FAST_MODEL",
+  sonnet: "STRANDS_CODEX_BALANCED_MODEL",
+  opus: "STRANDS_CODEX_STRONG_MODEL",
+  fable: "STRANDS_CODEX_LONG_MODEL",
 };
 
 export const codexModelOf = (tier) => process.env[MODEL_ENV[tier]] ?? DEFAULT_MODELS[tier];
@@ -101,7 +103,7 @@ export function codexConversationKey(body) {
   return createHash("sha1").update(String(stable)).digest("hex").slice(0, 12);
 }
 
-export function addJevModel(catalog) {
+export function addRouterModel(catalog) {
   if (!Array.isArray(catalog?.models) || catalog.models.some((model) => model.slug === CODEX_AUTO_MODEL)) {
     return catalog;
   }
@@ -113,8 +115,8 @@ export function addJevModel(catalog) {
   catalog.models.unshift({
     ...template,
     slug: CODEX_AUTO_MODEL,
-    display_name: "Jev Router",
-    description: "Jev picks the cheapest model that can complete each turn.",
+    display_name: "Strands Router",
+    description: "Decider picks the cheapest model that can complete each turn.",
     visibility: "list",
     supported_in_api: true,
     priority: 0,
@@ -140,12 +142,12 @@ export const upstreamFor = (
   apiBaseURL = API_BASE_URL,
 ) => /\/models(?:\?|$)/.test(path) || headers["chatgpt-account-id"] ? chatgptBaseURL : apiBaseURL;
 
-export function jevDecisionEvents({ tier, model = codexModelOf(tier), confidence, reason }) {
+export function deciderDecisionEvents({ tier, model = codexModelOf(tier), confidence, reason }) {
   const detail = confidence == null ? reason : `${reason}, confidence ${confidence.toFixed(2)}`;
-  const id = `jev-${randomUUID()}`;
-  const text = reason.startsWith("jev-unavailable")
-    ? `[Jev] unavailable; using ${model}. Add JEV_API_KEY=... to ~/.jev-router.env and restart jev-codex.`
-    : `[Jev] routed this turn to ${model} (${detail}).`;
+  const id = `decider-${randomUUID()}`;
+  const text = reason.startsWith("decider-unavailable")
+    ? `[Decider] unavailable; using ${model}. Is strands-decider serve running at ${deciderURL()}?`
+    : `[Decider] routed this turn to ${model} (${detail}).`;
   const item = {
     type: "message",
     role: "assistant",
@@ -161,14 +163,15 @@ export function jevDecisionEvents({ tier, model = codexModelOf(tier), confidence
   return events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
 }
 
-const debug = (line) => process.env.JEV_DEBUG && log(line);
+const debug = (line) => process.env.STRANDS_DEBUG && log(line);
 const upstreamPath = (base, path) => `${new URL(base).pathname.replace(/\/$/, "")}${path}`;
 
 export async function startCodexProxy({
   chatgptBaseURL = CHATGPT_BASE_URL,
   apiBaseURL = API_BASE_URL,
-  route = askJev,
+  route = askDecider,
   statusId = "",
+  record = appendEntry,
 } = {}) {
   const states = new Map();
   const models = new Map();
@@ -179,11 +182,13 @@ export async function startCodexProxy({
     req.on("end", async () => {
       let out = Buffer.concat(chunks);
       let routing;
+      // What to bill this response as, filled in once the request body is understood.
+      let tracking = null;
       if (req.method === "POST" && /\/responses(?:\?|$)/.test(req.url ?? "")) {
         try {
           const body = JSON.parse(out.toString());
-          if (process.env.JEV_DUMP) {
-            writeFileSync(`${process.env.JEV_DUMP}.${Date.now()}.json`, JSON.stringify(body, null, 2));
+          if (process.env.STRANDS_DUMP) {
+            writeFileSync(`${process.env.STRANDS_DUMP}.${Date.now()}.json`, JSON.stringify(body, null, 2));
           }
           if (body.model === CODEX_AUTO_MODEL) {
             const key = codexConversationKey(body);
@@ -194,16 +199,16 @@ export async function startCodexProxy({
             const currentModel = states.get(key)?.model ?? modelForTier(candidates, "opus");
             const current = codexTierOf(currentModel) ?? "opus";
             const prompt = codexNewTurnPrompt(body);
-            const explaining = prompt?.includes("<jev-explain>") || /^\$jev-explain\b/i.test(prompt ?? "");
+            const explaining = prompt?.includes("<strands-explain>") || /^\$strands-explain\b/i.test(prompt ?? "");
             let tier = current;
             let model = currentModel;
             if (prompt && !explaining) {
               const contextTokens = Math.round(JSON.stringify(body.input).length / 4);
-              const jev = await route({ prompt, current: currentModel, contextTokens, models: candidates });
-              const chosen = candidates.find((candidate) => candidate.id === jev?.choice);
+              const decider = await route({ prompt, current: currentModel, contextTokens, models: candidates });
+              const chosen = candidates.find((candidate) => candidate.id === decider?.choice);
               const decision = decide({
                 prompt,
-                jev: jev && { ...jev, choice: chosen?.tier },
+                decider: decider && { ...decider, choice: chosen?.tier },
                 current,
                 available,
                 contextTokens,
@@ -215,25 +220,42 @@ export async function startCodexProxy({
                   : tier === current
                     ? currentModel
                     : modelForTier(candidates, tier);
-              states.set(key, { tier, model });
+              states.set(key, { tier, model, reason: decision.reason });
               routing = {
                 prompt,
                 tier,
                 model,
-                confidence: jev?.confidence ?? null,
-                metrics: jev?.metrics ?? null,
+                confidence: decider?.confidence ?? null,
+                metrics: decider?.metrics ?? null,
                 reason: decision.reason,
-                jev: jev ? { request: jev.request, response: jev.response } : null,
+                ms: decider?.ms ?? null,
+                decider: decider ? { request: decider.request, response: decider.response } : null,
                 at: Date.now(),
               };
               writeDecision(statusId, routing);
               debug(`${key} ${current} -> ${tier} (${decision.reason}) | ${prompt.slice(0, 60)}`);
             }
             applyCodexTier(body, tier, models, model);
+            const baseline = resolveBaseline({
+              modelForTier: (t) => modelForTier(codexModels(models), t),
+              tierOf: codexTierOf,
+              tiers: TIER_NAMES,
+            });
+            tracking = {
+              routed: true,
+              model,
+              baseline,
+              session: statusId,
+              reason: states.get(key)?.reason ?? null,
+              turn: Boolean(routing),
+              direction: routing ? directionOf(rankOf, tier, codexTierOf(baseline)) : null,
+              deciderMs: routing?.ms ?? null,
+            };
           } else {
             const prompt = codexNewTurnPrompt(body);
-            const explaining = prompt?.includes("<jev-explain>") || /^\$jev-explain\b/i.test(prompt ?? "");
+            const explaining = prompt?.includes("<strands-explain>") || /^\$strands-explain\b/i.test(prompt ?? "");
             if (prompt && !explaining) writeStatus(statusId, { manual: true, at: Date.now() });
+            tracking = { routed: false, model: body.model, session: statusId };
           }
           out = Buffer.from(JSON.stringify(body));
         } catch (err) {
@@ -246,6 +268,8 @@ export async function startCodexProxy({
       const transport = target.protocol === "http:" ? http : https;
       const headers = { ...req.headers, host: target.host };
       delete headers["content-length"];
+      // Usage is read from the response as it streams past, which needs it uncompressed.
+      if (tracking) delete headers["accept-encoding"];
       const upstream = transport.request(
         {
           hostname: target.hostname,
@@ -263,7 +287,7 @@ export async function startCodexProxy({
             response.on("end", () => {
               let data = Buffer.concat(body);
               try {
-                const catalog = addJevModel(JSON.parse(data.toString()));
+                const catalog = addRouterModel(JSON.parse(data.toString()));
                 for (const model of catalog.models) models.set(model.slug, model);
                 data = Buffer.from(JSON.stringify(catalog));
                 delete responseHeaders["content-length"];
@@ -274,6 +298,19 @@ export async function startCodexProxy({
               res.end(data);
             });
             return;
+          }
+
+          const encoding = response.headers["content-encoding"];
+          if (
+            tracking &&
+            response.statusCode >= 200 &&
+            response.statusCode < 300 &&
+            (!encoding || encoding === "identity")
+          ) {
+            const tracker = trackResponse({ cli: "codex", provider: "openai", record, ...tracking });
+            response.on("data", (chunk) => tracker.write(chunk));
+            response.on("end", () => tracker.end());
+            response.on("aborted", () => tracker.end());
           }
 
           const inspectForDecision = routing && response.statusCode >= 200 && response.statusCode < 300;
@@ -293,7 +330,7 @@ export async function startCodexProxy({
             const first = pending.slice(0, end + 2);
             res.write(first);
             const isSSE = /^(?:event|data):/m.test(first);
-            if (isSSE) res.write(jevDecisionEvents(routing));
+            if (isSSE) res.write(deciderDecisionEvents(routing));
             debug(`codex decision display ${isSSE ? "inject" : "skip"}`);
             res.write(pending.slice(end + 2));
             pending = "";

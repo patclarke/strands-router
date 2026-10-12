@@ -1,18 +1,19 @@
 {
-  "name": "jev-router",
-  "version": "0.3.0",
-  "description": "Runs coding CLIs and routes each turn to the cheapest sufficient model using TypeSafe Jev",
+  "name": "strands-router",
+  "version": "0.1.0",
+  "description": "Runs Claude Code and Codex through a local Strands Decider 2B router that picks the cheapest sufficient model per turn, and tracks the dollars it saves",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/gargpratyush/jev-router.git"
+    "url": "git+https://github.com/patclarke/strands-router.git"
   },
-  "homepage": "https://github.com/gargpratyush/jev-router#readme",
-  "bugs": "https://github.com/gargpratyush/jev-router/issues",
+  "homepage": "https://github.com/patclarke/strands-router#readme",
+  "bugs": "https://github.com/patclarke/strands-router/issues",
   "bin": {
-    "jev-claude": "bin/jev-claude.mjs",
-    "jev-codex": "bin/jev-codex.mjs",
-    "jev-explain": "bin/jev-explain.mjs"
+    "strands-claude": "bin/strands-claude.mjs",
+    "strands-codex": "bin/strands-codex.mjs",
+    "strands-explain": "bin/strands-explain.mjs",
+    "strands-savings": "bin/strands-savings.mjs"
   },
   "scripts": {
     "test": "node --test \"test/**/*.test.mjs\"",
@@ -30,18 +31,12 @@
     "claude-code",
     "codex",
     "model-routing",
-    "jev",
-    "typesafe"
+    "strands",
+    "strands-decider",
+    "cost-tracking"
   ],
   "engines": {
     "node": ">=20.12"
   },
-  "publishConfig": {
-    "access": "public",
-    "registry": "https://registry.npmjs.org"
-  },
-  "license": "MIT",
-  "dependencies": {
-    "@typesafe-ai/sdk": "^0.6.0"
-  }
+  "license": "MIT"
 }

@@ -13,31 +13,31 @@ const wrapped = (label, value) => {
 
 const decision = (reason = "") => {
   if (reason.includes("override")) return "prompt override";
-  if (reason.includes("jev-unavailable")) return "Jev unavailable; held";
+  if (reason.includes("decider-unavailable")) return "decider down; held";
   if (reason.includes("low-confidence-no-downgrade")) return "low confidence; held";
   if (reason.includes("low-confidence-capped")) return "low confidence; capped";
   if (reason.includes("cache-rebuild")) return "cache rebuild avoided";
   if (reason.includes("unavailable")) return "nearest available tier";
-  return "Jev recommendation";
+  return "Decider's pick";
 };
 
 export function formatExplanation(status) {
-  if (!status) return "Jev Router: no routing decision has been recorded for this session.";
-  if (status.manual) return "Jev Router: routing is paused because you selected a model manually.";
+  if (!status) return "Strands Router: no routing decision has been recorded for this session.";
+  if (status.manual) return "Strands Router: routing is paused because you selected a model manually.";
 
   const m = status.metrics ?? {};
-  const request = status.jev?.request?.state;
-  const recommendation = status.jev?.response?.answers?.model_tier?.choice ?? status.tier ?? "unknown";
+  const request = status.decider?.request?.state;
+  const recommendation = status.decider?.response?.answers?.model?.choice ?? status.tier ?? "unknown";
   return [
     `┌${"─".repeat(WIDTH)}┐`,
-    row("Jev Router"),
+    row("Strands Router"),
     row(),
-    row("Jev request"),
+    row("Decider request"),
     ...wrapped("Prompt: ", status.prompt ?? "not recorded"),
     row(`Current tier: ${(request?.session?.current_model ?? "unknown").toUpperCase()}`),
     row(`Context tokens: ${request?.session?.context_tokens ?? "unknown"}`),
     row(),
-    row("Jev response"),
+    row("Decider response"),
     row(`Task complexity     ${metric(m.taskComplexity)}`),
     row(`Reasoning required  ${metric(m.reasoningRequired)}`),
     row(`Tool complexity     ${metric(m.toolComplexity)}`),

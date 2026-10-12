@@ -4,13 +4,15 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CODEX_AUTO_MODEL, startCodexProxy } from "./codex-proxy.mjs";
+import { deciderURL } from "./config.mjs";
+import { deciderHealth, warmUp } from "./router.mjs";
 
-const PROVIDER = "jev";
+const PROVIDER = "decider";
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
-const EXPLAIN_SKILL = join(ROOT, "skills", "codex", "jev-explain", "SKILL.md");
+const EXPLAIN_SKILL = join(ROOT, "skills", "codex", "strands-explain", "SKILL.md");
 
 export function installCodexSkill(home = homedir()) {
-  const target = join(home, ".agents", "skills", "jev-router-explain", "SKILL.md");
+  const target = join(home, ".agents", "skills", "strands-router-explain", "SKILL.md");
   mkdirSync(dirname(target), { recursive: true });
   copyFileSync(EXPLAIN_SKILL, target);
   return target;
@@ -19,8 +21,7 @@ export function installCodexSkill(home = homedir()) {
 export function loadEnv() {
   for (const file of [
     join(process.cwd(), ".env"),
-    join(homedir(), ".jev-router.env"),
-    join(homedir(), ".jev-claude.env"),
+    join(homedir(), ".strands-router.env"),
   ]) {
     try {
       process.loadEnvFile(file);
@@ -58,7 +59,7 @@ export const codexArgs = (baseURL, args) => [
   "--config",
   `model_provider="${PROVIDER}"`,
   "--config",
-  `model_providers.${PROVIDER}.name="Jev Router"`,
+  `model_providers.${PROVIDER}.name="Strands Router"`,
   "--config",
   `model_providers.${PROVIDER}.base_url="${baseURL}"`,
   "--config",
@@ -76,14 +77,14 @@ export async function runCodex() {
   try {
     installCodexSkill();
   } catch (err) {
-    process.stderr.write(`[jev] could not install the Codex explanation skill: ${err.message}\n`);
+    process.stderr.write(`[strands] could not install the Codex explanation skill: ${err.message}\n`);
   }
   const command = resolveCodex();
   if (!command) {
     process.stderr.write(
-      "[jev] OpenAI Codex is not installed, or `codex` is not on your PATH.\n" +
-        "[jev] jev-codex runs the real Codex CLI; install it first:\n" +
-        "[jev]   https://developers.openai.com/codex/cli\n",
+      "[strands] OpenAI Codex is not installed, or `codex` is not on your PATH.\n" +
+        "[strands] strands-codex runs the real Codex CLI; install it first:\n" +
+        "[strands]   https://developers.openai.com/codex/cli\n",
     );
     process.exitCode = 1;
     return;
@@ -92,16 +93,22 @@ export async function runCodex() {
   let args = process.argv.slice(2);
   let close = () => {};
   const statusId = `codex-${process.pid}`;
-  process.env.JEV_CODEX_STATUS_ID = statusId;
-  if (process.env.JEV_API_KEY || process.env.TYPESAFE_API_KEY) {
+  process.env.STRANDS_CODEX_STATUS_ID = statusId;
+  if (process.env.STRANDS_DISABLE !== "1") {
+    const health = await deciderHealth();
+    if (health) {
+      warmUp();
+    } else {
+      process.stderr.write(
+        `[strands] Strands Decider is not reachable at ${deciderURL()} - routing will hold the current model\n` +
+          "[strands] start it with: strands-decider serve StrandsAgents/strands-decider-2B-hobson-v19 --port 8000\n",
+      );
+    }
     const proxy = await startCodexProxy({ statusId });
     close = proxy.close;
     args = codexArgs(`http://127.0.0.1:${proxy.port}`, args);
   } else {
-    process.stderr.write(
-      "[jev] no JEV_API_KEY found - starting Codex without routing\n" +
-        `[jev] add JEV_API_KEY=... to ${join(homedir(), ".jev-router.env")} and restart jev-codex\n`,
-    );
+    process.stderr.write("[strands] STRANDS_DISABLE=1 - starting Codex without routing\n");
   }
 
   const childArgs = [...command.prefix, ...args];
@@ -112,7 +119,7 @@ export async function runCodex() {
   );
   child.on("error", (err) => {
     close();
-    process.stderr.write(`[jev] could not start Codex: ${err.message}\n`);
+    process.stderr.write(`[strands] could not start Codex: ${err.message}\n`);
     process.exitCode = 1;
   });
   child.on("exit", (code, signal) => {

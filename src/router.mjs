@@ -1,39 +1,86 @@
-import { TypeSafeClient } from "@typesafe-ai/sdk";
 import {
   COMPLEXITY_MAX_SCORE,
   CONTEXT_WINDOW_TOKENS,
   QUESTIONS,
   questionForModels,
   THRESHOLDS,
+  deciderURL,
 } from "./config.mjs";
 import { log } from "./log.mjs";
 
-// The SDK's defaults (10s per attempt, 2 retries, no total budget) are far too slow for a
-// per-prompt hot path, so the timeout, retry count and an outer deadline are all pinned.
-// Built lazily because the constructor throws when no key is present, and a missing key
-// should degrade to "no routing", not stop the session from starting.
-let client;
-function getClient() {
-  client ??= new TypeSafeClient({
-    apiKey: process.env.JEV_API_KEY ?? process.env.TYPESAFE_API_KEY,
-    timeout: THRESHOLDS.jevTimeoutMs,
-    retry: { maxRetries: THRESHOLDS.jevMaxRetries, backoffInitialMs: 150, backoffMaxMs: 400 },
-    logLevel: "warn", // never "debug": request bodies contain the user's prompt
-  });
-  return client;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * POSTs one System One request to the local Strands Decider server. Each attempt has its own
+ * timeout, and `signal` is the outer deadline for the whole call, so a cold model load can't
+ * hold a prompt hostage. No API key: the server is on loopback and only this user can reach it.
+ */
+export async function systemOne(request, { signal, url = deciderURL(), fetchImpl = fetch } = {}) {
+  let lastError;
+  for (let attempt = 0; attempt <= THRESHOLDS.deciderMaxRetries; attempt++) {
+    if (attempt) await sleep(150);
+    const perAttempt = AbortSignal.timeout(THRESHOLDS.deciderTimeoutMs);
+    try {
+      const res = await fetchImpl(`${url}/v1/systemone`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(request),
+        signal: signal ? AbortSignal.any([signal, perAttempt]) : perAttempt,
+      });
+      if (!res.ok) {
+        // 422 is a malformed question, which a retry will not fix.
+        const detail = (await res.text().catch(() => "")).slice(0, 300);
+        const err = new Error(`decider HTTP ${res.status}: ${detail}`);
+        if (res.status < 500) throw Object.assign(err, { fatal: true });
+        throw err;
+      }
+      return await res.json();
+    } catch (err) {
+      lastError = err;
+      if (err.fatal || signal?.aborted) break;
+    }
+  }
+  throw lastError;
+}
+
+/** Whether the Decider server is up, for a friendly warning at launch. */
+export async function deciderHealth({ url = deciderURL(), timeoutMs = 1500, fetchImpl = fetch } = {}) {
+  try {
+    const res = await fetchImpl(`${url}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    return res.ok ? await res.json() : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
- * Asks Jev which tier fits this prompt. Returns null on any failure, which the policy
- * layer reads as "keep the current model" — routing must never block a prompt.
+ * The first request after the server starts pays for kernel compilation and cache warm-up
+ * (noticeably so on Apple silicon), so one throwaway question is sent at launch rather than
+ * charging that latency to the user's first prompt.
+ */
+export function warmUp({ url = deciderURL(), fetchImpl = fetch } = {}) {
+  return fetchImpl(`${url}/v1/systemone`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      state: "warm up",
+      questions: { ready: { type: "noul", instructions: "Is this a greeting?" } },
+    }),
+    signal: AbortSignal.timeout(30000),
+  }).catch(() => null);
+}
+
+/**
+ * Asks Strands Decider which model fits this prompt. Returns null on any failure, which the
+ * policy layer reads as "keep the current model" — routing must never block a prompt.
  *
  * @returns {Promise<?{choice: string, confidence: number, probabilities: object, metrics: object, ms: number}>}
  */
-export async function askJev({ prompt, current, contextTokens, models }) {
+export async function askDecider({ prompt, current, contextTokens, models, send = systemOne }) {
   if (!models?.length) return null;
   const started = Date.now();
   const abort = new AbortController();
-  const deadline = setTimeout(() => abort.abort(), THRESHOLDS.jevDeadlineMs);
+  const deadline = setTimeout(() => abort.abort(), THRESHOLDS.deciderDeadlineMs);
   const request = {
     state: {
       request: prompt,
@@ -43,7 +90,7 @@ export async function askJev({ prompt, current, contextTokens, models }) {
     questions: { ...QUESTIONS, model: questionForModels(models) },
   };
   try {
-    const result = await getClient().systemOne(request, { signal: abort.signal });
+    const result = await send(request, { signal: abort.signal });
     const { model: answer, task_complexity, reasoning_required, tool_complexity } = result.answers;
     return {
       ...answer,
