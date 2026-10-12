@@ -9,8 +9,9 @@
 #   scripts/decider.sh stop        macOS: remove the launchd job
 #
 # Settings (environment): STRANDS_DECIDER_CHECKPOINT, STRANDS_DECIDER_PORT, STRANDS_DECIDER_DEVICE,
-# STRANDS_DECIDER_PREFIX_CACHE (0 turns it off), STRANDS_HOME (default ~/.strands-router,
-# where the venv and logs live).
+# STRANDS_DECIDER_PREFIX_CACHE (0 turns it off), STRANDS_DECIDER_KEEPWARM (seconds idle before a
+# keep-warm ping, default 20; 0 turns it off), STRANDS_HOME (default ~/.strands-router, where the
+# venv and logs live).
 set -euo pipefail
 
 HOME_DIR="${STRANDS_HOME:-$HOME/.strands-router}"
@@ -19,6 +20,7 @@ CHECKPOINT="${STRANDS_DECIDER_CHECKPOINT:-StrandsAgents/strands-decider-2B-hobso
 PORT="${STRANDS_DECIDER_PORT:-8000}"
 DEVICE="${STRANDS_DECIDER_DEVICE:-}"
 PREFIX_CACHE="${STRANDS_DECIDER_PREFIX_CACHE:-1}"
+KEEPWARM="${STRANDS_DECIDER_KEEPWARM:-20}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LABEL="com.strands-router.decider"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -55,6 +57,7 @@ serve_args() {
   local args=("$VENV/bin/python" "$HERE/serve_decider.py" "$CHECKPOINT" --host 127.0.0.1 --port "$PORT")
   [[ -n "$DEVICE" ]] && args+=(--device "$DEVICE")
   [[ "$PREFIX_CACHE" == "0" ]] && args+=(--no-prefix-cache)
+  args+=(--keep-warm "$KEEPWARM")
   printf '%s\n' "${args[@]}"
 }
 
@@ -147,5 +150,5 @@ case "${1:-}" in
   diagnose) cmd_diagnose ;;
   autostart) cmd_autostart ;;
   stop) cmd_stop ;;
-  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

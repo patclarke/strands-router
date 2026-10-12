@@ -64,10 +64,13 @@ own server app through `scripts/serve_decider.py`, which keeps every model call 
 (the stock `strands-decider serve` segfaulted on an Apple-silicon Mac when requests landed on
 different threads) and pays the one-off GPU warm-up (~35 s measured) before it starts listening.
 
-**Expect about 1–4 s per routing decision on a Mac**, added to the first request of each turn.
-That's what we measured on real hardware, well above the ~150 ms per question Strands reports
-for an M3 Pro. If the decider isn't running or doesn't answer within `STRANDS_DECIDER_DEADLINE_MS`,
-routing fails open (the current model is kept); usage and savings are still recorded.
+**Routing adds about half a second to the first request of each turn on a Mac** (median 463 ms
+measured with the default question). The model goes cold when idle: on an Apple-silicon Mac a
+question took 1 s right after another but 11–14 s after a few idle minutes. So the server runs a
+tiny keep-warm question whenever it has been idle for 20 s (`STRANDS_DECIDER_KEEPWARM`, `0` turns
+it off), which keeps the GPU lightly busy while the server runs. If the decider isn't running or
+doesn't answer within `STRANDS_DECIDER_DEADLINE_MS`, routing fails open (the current model is
+kept); usage and savings are still recorded.
 
 If serving misbehaves, `scripts/decider.sh diagnose` runs the router's request against the model
 in isolated processes (MPS with and without Decider's prefix cache, and CPU), times each, and
