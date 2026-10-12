@@ -2,7 +2,11 @@ import {
   COMPLEXITY_MAX_SCORE,
   CONTEXT_WINDOW_TOKENS,
   QUESTIONS,
+  askMetrics,
+  compactQuestion,
   questionForModels,
+  questionStyle,
+  tierOfCompactLabel,
   THRESHOLDS,
   deciderURL,
 } from "./config.mjs";
@@ -71,35 +75,75 @@ export function warmUp({ url = deciderURL(), fetchImpl = fetch } = {}) {
 }
 
 /**
- * Asks Strands Decider which model fits this prompt. Returns null on any failure, which the
- * policy layer reads as "keep the current model" — routing must never block a prompt.
- *
- * @returns {Promise<?{choice: string, confidence: number, probabilities: object, metrics: object, ms: number}>}
+ * The System One request for one routing decision. `compact` asks a short tier question over
+ * the bare prompt; `detailed` is jev-router's question over every exact model, with session
+ * context in the state. The complexity scores are added only when `metrics` is set.
  */
-export async function askDecider({ prompt, current, contextTokens, models, send = systemOne }) {
-  if (!models?.length) return null;
-  const started = Date.now();
-  const abort = new AbortController();
-  const deadline = setTimeout(() => abort.abort(), THRESHOLDS.deciderDeadlineMs);
-  const request = {
+export function buildRequest({
+  prompt,
+  current,
+  contextTokens,
+  models,
+  style = questionStyle(),
+  metrics = askMetrics(),
+}) {
+  const extra = metrics ? QUESTIONS : {};
+  if (style === "compact") {
+    const tiers = [...new Set(models.map((model) => model.tier))];
+    return { state: prompt, questions: { ...extra, model: compactQuestion(tiers) } };
+  }
+  return {
     state: {
       request: prompt,
       session: { current_model: current, context_tokens: contextTokens },
       environment: { available_models: models.map((model) => model.id) },
     },
-    questions: { ...QUESTIONS, model: questionForModels(models) },
+    questions: { ...extra, model: questionForModels(models) },
   };
+}
+
+/**
+ * Maps a compact answer ("fast") onto the newest model of that tier, so callers always get an
+ * exact model id, as they do from the detailed question.
+ */
+function resolveAnswer(answer, models) {
+  const tier = tierOfCompactLabel(answer.choice);
+  if (!tier) return answer;
+  const idFor = (label) => models.find((model) => model.tier === tierOfCompactLabel(label))?.id;
+  const probabilities = {};
+  for (const [label, p] of Object.entries(answer.probabilities ?? {})) {
+    const id = idFor(label);
+    if (id) probabilities[id] = p;
+  }
+  return { ...answer, choice: idFor(answer.choice) ?? null, probabilities };
+}
+
+const scaled = (answer) =>
+  answer && Number.isFinite(answer.score) ? answer.score / COMPLEXITY_MAX_SCORE : null;
+
+/**
+ * Asks Strands Decider which model fits this prompt. Returns null on any failure, which the
+ * policy layer reads as "keep the current model" — routing must never block a prompt.
+ *
+ * @returns {Promise<?{choice: string, confidence: number, probabilities: object, metrics: object, ms: number}>}
+ */
+export async function askDecider({ prompt, current, contextTokens, models, send = systemOne, ...options }) {
+  if (!models?.length) return null;
+  const started = Date.now();
+  const abort = new AbortController();
+  const deadline = setTimeout(() => abort.abort(), THRESHOLDS.deciderDeadlineMs);
+  const request = buildRequest({ prompt, current, contextTokens, models, ...options });
   try {
     const result = await send(request, { signal: abort.signal });
     const { model: answer, task_complexity, reasoning_required, tool_complexity } = result.answers;
     return {
-      ...answer,
+      ...resolveAnswer(answer, models),
       request,
       response: result,
       metrics: {
-        taskComplexity: task_complexity.score / COMPLEXITY_MAX_SCORE,
-        reasoningRequired: reasoning_required.score / COMPLEXITY_MAX_SCORE,
-        toolComplexity: tool_complexity.score / COMPLEXITY_MAX_SCORE,
+        taskComplexity: scaled(task_complexity),
+        reasoningRequired: scaled(reasoning_required),
+        toolComplexity: scaled(tool_complexity),
         contextSize: Math.min(contextTokens / CONTEXT_WINDOW_TOKENS, 1),
       },
       ms: Date.now() - started,

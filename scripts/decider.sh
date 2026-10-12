@@ -9,8 +9,9 @@
 #   scripts/decider.sh stop        macOS: remove the launchd job
 #
 # Settings (environment): STRANDS_DECIDER_CHECKPOINT, STRANDS_DECIDER_PORT, STRANDS_DECIDER_DEVICE,
-# STRANDS_DECIDER_PREFIX_CACHE (0 turns it off), STRANDS_HOME (default ~/.strands-router,
-# where the venv and logs live).
+# STRANDS_DECIDER_PREFIX_CACHE (0 turns it off), STRANDS_DECIDER_KEEPWARM (seconds idle before a
+# keep-warm ping, default 20; 0 turns it off), STRANDS_HOME (default ~/.strands-router, where the
+# venv and logs live).
 set -euo pipefail
 
 HOME_DIR="${STRANDS_HOME:-$HOME/.strands-router}"
@@ -19,6 +20,7 @@ CHECKPOINT="${STRANDS_DECIDER_CHECKPOINT:-StrandsAgents/strands-decider-2B-hobso
 PORT="${STRANDS_DECIDER_PORT:-8000}"
 DEVICE="${STRANDS_DECIDER_DEVICE:-}"
 PREFIX_CACHE="${STRANDS_DECIDER_PREFIX_CACHE:-1}"
+KEEPWARM="${STRANDS_DECIDER_KEEPWARM:-20}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LABEL="com.strands-router.decider"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -49,10 +51,13 @@ cmd_install() {
   echo "decider: the first 'serve' downloads the $CHECKPOINT weights from Hugging Face (a few GB)."
 }
 
+# The full server command. serve_decider.py wraps the stock `strands-decider serve` app so all
+# model work stays on one thread (the stock server segfaulted on a Mac) and warms up first.
 serve_args() {
-  local args=(serve "$CHECKPOINT" --host 127.0.0.1 --port "$PORT")
+  local args=("$VENV/bin/python" "$HERE/serve_decider.py" "$CHECKPOINT" --host 127.0.0.1 --port "$PORT")
   [[ -n "$DEVICE" ]] && args+=(--device "$DEVICE")
   [[ "$PREFIX_CACHE" == "0" ]] && args+=(--no-prefix-cache)
+  args+=(--keep-warm "$KEEPWARM")
   printf '%s\n' "${args[@]}"
 }
 
@@ -64,7 +69,7 @@ cmd_serve() {
   export PYTHONFAULTHANDLER=1
   local args=()
   while IFS= read -r arg; do args+=("$arg"); done < <(serve_args)  # bash 3.2 has no mapfile
-  exec "$VENV/bin/strands-decider" "${args[@]}"
+  exec "${args[@]}"
 }
 
 cmd_check() {
@@ -82,6 +87,7 @@ cmd_autostart() {
   mkdir -p "$(dirname "$PLIST")" "$HOME_DIR/logs"
   local program_args=""
   while IFS= read -r arg; do program_args+="    <string>$arg</string>"$'\n'; done < <(serve_args)
+  echo "decider: the launchd job runs scripts from $HERE; re-run autostart if you move the repo."
   cat >"$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -90,7 +96,6 @@ cmd_autostart() {
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$VENV/bin/strands-decider</string>
 $program_args  </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -145,5 +150,5 @@ case "${1:-}" in
   diagnose) cmd_diagnose ;;
   autostart) cmd_autostart ;;
   stop) cmd_stop ;;
-  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

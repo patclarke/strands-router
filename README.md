@@ -48,6 +48,7 @@ In a second terminal:
 
 ```bash
 scripts/decider.sh check         # one test question against the running server
+node scripts/live-routing.mjs    # labelled routing benchmark through the router's own code
 strands-claude                   # or: strands-codex
 ```
 
@@ -58,11 +59,22 @@ scripts/decider.sh autostart     # logs: ~/.strands-router/logs/decider.log
 scripts/decider.sh stop          # remove the launchd job
 ```
 
-The server auto-detects the device (`cuda` > `mps` > `cpu`). Strands reports a warm median of
-about 150 ms per question on an M3 Pro; the router asks four questions about one prompt in a
-single call, and the state is read only once. If the decider isn't running, `strands-claude`
-says so at launch and routing fails open (the current model is kept) — usage and savings are
-still recorded.
+The server auto-detects the device (`cuda` > `mps` > `cpu`). `decider.sh serve` runs Strands'
+own server app through `scripts/serve_decider.py`, which keeps every model call on one thread
+(the stock `strands-decider serve` segfaulted on an Apple-silicon Mac when requests landed on
+different threads) and pays the one-off GPU warm-up (~35 s measured) before it starts listening.
+
+**Routing adds about half a second to the first request of each turn on a Mac** (median 463 ms
+measured with the default question). The model goes cold when idle: on an Apple-silicon Mac a
+question took 1 s right after another but 11–14 s after a few idle minutes. So the server runs a
+tiny keep-warm question whenever it has been idle for 20 s (`STRANDS_DECIDER_KEEPWARM`, `0` turns
+it off), which keeps the GPU lightly busy while the server runs. If the decider isn't running or
+doesn't answer within `STRANDS_DECIDER_DEADLINE_MS`, routing fails open (the current model is
+kept); usage and savings are still recorded.
+
+If serving misbehaves, `scripts/decider.sh diagnose` runs the router's request against the model
+in isolated processes (MPS with and without Decider's prefix cache, and CPU), times each, and
+recommends settings.
 
 No Anthropic or OpenAI API key is required when the CLI is already logged in. Every CLI argument
 is forwarded:
@@ -116,7 +128,12 @@ In order of precedence:
 
 1. `STRANDS_BASELINE_MODEL` — an exact model id (`claude-opus-5-5`) or a tier (`opus`, `sonnet`).
 2. For Claude, the default model saved in `~/.claude/settings.json` before the session started.
-3. The strong tier (Opus / `gpt-5.6-sol`) — what both launchers start a routed session on.
+3. The strong tier (Opus / `gpt-5.6-sol`).
+
+A Claude session **starts on the baseline model** and the decider moves it from there, so every
+dollar in the ledger comes from a routing decision rather than from where routing happened to
+begin. If your saved default is Fable, the long tier is enabled automatically so routing can stay
+on Fable for big tasks (set `STRANDS_ALLOW_FABLE=0` to cap at Opus instead).
 
 Requests where you picked a model yourself, and Claude Code's own background calls (titles,
 summaries), are recorded with zero savings: routing didn't touch them, but they're part of what
@@ -238,6 +255,21 @@ Decider's confidence is calibrated (Strands reports answers at ≥ 0.9 are right
 unseen short classification tasks), but it was not trained on this routing question specifically.
 If it downgrades too eagerly for your taste, raise `THRESHOLDS.minConfidence` in `src/config.mjs`.
 
+### Question style
+
+Decider is a general classifier, so how the question is phrased matters a lot. Two styles are
+available (`STRANDS_QUESTION_STYLE`):
+
+- `compact` (default): the bare prompt as the state, and one question with short `fast` /
+  `balanced` / `strong` options. The answer is mapped to the newest model of that tier.
+- `detailed`: jev-router's original question over every exact model in the account's catalog,
+  with session context in the state. On real Mac hardware it answered with ~0.17 confidence,
+  below the 0.3 the policy needs before it will move to a cheaper model, so it rarely saved anything.
+
+The three complexity scores shown by `/strands-explain` aren't used for routing and add latency,
+so they're off unless `STRANDS_DECIDER_METRICS=1`. `node scripts/live-routing.mjs` compares all
+four combinations on labelled prompts, so you can check which works best on your machine.
+
 ## Configuration
 
 Set in the environment, a `.env` in the launch directory, or `~/.strands-router.env`.
@@ -245,12 +277,14 @@ Set in the environment, a `.env` in the launch directory, or `~/.strands-router.
 | Variable | Interface | Effect |
 | --- | --- | --- |
 | `STRANDS_DECIDER_URL` | Both | Decider server; default `http://127.0.0.1:8000`. |
-| `STRANDS_DECIDER_TIMEOUT_MS` | Both | Per-attempt timeout; default 2500. |
-| `STRANDS_DECIDER_DEADLINE_MS` | Both | Hard deadline for one routing call; default 4000. |
+| `STRANDS_DECIDER_TIMEOUT_MS` | Both | Per-attempt timeout; default 6000. |
+| `STRANDS_DECIDER_DEADLINE_MS` | Both | Hard deadline for one routing call; default 6500. |
+| `STRANDS_QUESTION_STYLE` | Both | `compact` (default) or `detailed`; see Question style. |
+| `STRANDS_DECIDER_METRICS` | Both | `1` also asks the complexity scores for `/strands-explain`. |
 | `STRANDS_BASELINE_MODEL` | Both | Model (or tier) savings are measured against. |
 | `STRANDS_HOME` | Both | Ledger, pricing overrides, venv, logs; default `~/.strands-router`. |
 | `STRANDS_DISABLE` | Both | `1` launches the CLI with no proxy at all. |
-| `STRANDS_ALLOW_FABLE` | Both | Enables the opt-in long tier. |
+| `STRANDS_ALLOW_FABLE` | Both | `1` enables the opt-in long tier; on by default when your saved Claude default is Fable. |
 | `STRANDS_DEBUG` | Both | Logs decisions, rewrites and per-response costs to `~/.strands-router.log`. |
 | `STRANDS_DUMP` | Both | Dumps request bodies for debugging wire-format changes. |
 | `STRANDS_NO_STATUSLINE` | Claude | Disables the injected status line. |

@@ -5,7 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startProxy } from "../src/proxy.mjs";
-import { AUTO_MODEL, deciderURL } from "../src/config.mjs";
+import { AUTO_MODEL, deciderURL, tierOf } from "../src/config.mjs";
 import { deciderHealth, warmUp } from "../src/router.mjs";
 import { readSavedModel, restoreSavedModel } from "../src/settings.mjs";
 import { LOG_FILE } from "../src/log.mjs";
@@ -122,6 +122,11 @@ if (!claude) {
 }
 
 if (process.env.STRANDS_DISABLE !== "1") {
+  // Sessions start on the user's saved default. Fable is opt-in because it bills extra usage,
+  // but when it already is the default, routing must be able to stay there, not cap at Opus.
+  if (tierOf(savedModelBefore) === "fable" && process.env.STRANDS_ALLOW_FABLE === undefined) {
+    process.env.STRANDS_ALLOW_FABLE = "1";
+  }
   // The proxy runs even when the decider is down: routing then fails open to the current
   // model, but usage and savings are still recorded, and the decider can be started later.
   const health = await deciderHealth();

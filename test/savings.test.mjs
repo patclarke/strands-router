@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 import { appendFileSync, mkdtempSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -189,7 +190,7 @@ test("Claude proxy records a routed turn's cost against the Opus baseline", asyn
   t.after(proxy.close);
 
   await fetch(`http://127.0.0.1:${proxy.port}/v1/models`).then((r) => r.json());
-  const sid = `savings-${process.pid}`;
+  const sid = `savings-${randomUUID()}`; // unique: per-session totals persist across runs in the temp dir
   const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
     method: "POST",
     headers: { "content-type": "application/json", "accept-encoding": "gzip, br" },

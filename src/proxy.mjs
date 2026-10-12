@@ -58,7 +58,9 @@ export function sanitizeSchema(node) {
  */
 export function newTurnPrompt(body) {
   if (!Array.isArray(body?.tools) || body.tools.length === 0) return null; // auxiliary call
-  const last = body?.messages?.[body.messages.length - 1];
+  // Newer Claude Code versions append mid-conversation system messages (reminders) after the
+  // user's message, so the turn is decided by the last message that isn't one of those.
+  const last = body?.messages?.findLast((message) => message?.role !== "system");
   if (!last || last.role !== "user") return null;
   let text;
   if (typeof last.content === "string") {
@@ -227,8 +229,23 @@ export async function startProxy({
           } else {
             const key = conversationKey(body);
             const state = stateFor(key);
+            const baseline = resolveBaseline({
+              saved: baselineModel,
+              modelForTier: (t) => modelForTier(claudeModels([...catalog.values()]), t),
+              tierOf,
+              tiers: TIER_NAMES,
+            });
+            // A session starts on the model it would have used without routing, so every saving
+            // the ledger records comes from a routing decision, not from where routing began.
+            const startTier = availableTiers().includes(tierOf(baseline)) ? tierOf(baseline) : "opus";
+            // The baseline itself when a tier is the baseline's, so a session that is never moved
+            // runs exactly the model it is compared against (minus Claude Code's "[1m]" alias).
+            const modelFor = (tier) =>
+              tier === tierOf(baseline)
+                ? baseline.replace(/\[.*\]$/, "")
+                : modelForTier(claudeModels([...catalog.values()]), tier);
             // What the prompt cache was built on, which is what a downgrade would discard.
-            const current = state.tier ?? "opus";
+            const current = state.tier ?? startTier;
             const prompt = newTurnPrompt(body);
             const explaining = prompt?.includes("<strands-explain>");
             let fresh = null;
@@ -237,7 +254,7 @@ export async function startProxy({
                 availableTiers().includes(model.tier),
               );
               const available = [...new Set(models.map((model) => model.tier))];
-              const currentModel = state.model ?? modelForTier(models, current);
+              const currentModel = state.model ?? modelFor(current);
               const contextTokens = Math.round(JSON.stringify(body.messages).length / 4);
               const decider = await route({ prompt, current: currentModel, contextTokens, models });
               const chosen = models.find((model) => model.id === decider?.choice);
@@ -275,7 +292,7 @@ export async function startProxy({
             // The sentinel is not a real model, so every routed request must be rewritten,
             // including follow-ups that reuse the tier chosen for the turn.
             const tier = state.tier ?? current;
-            const model = state.model ?? idOf(tier);
+            const model = state.model ?? modelFor(tier);
             debug(`${key} rewrite ${body.model} -> ${model}`);
             applyTier(body, tier, model);
             // Publish what went out. Claude Code's UI shows the row you picked, not the tier
@@ -287,12 +304,6 @@ export async function startProxy({
             if (fresh && !explaining) {
               writeDecision(sessionOf(body) || key, { tier, ...fresh, at: Date.now() });
             }
-            const baseline = resolveBaseline({
-              saved: baselineModel,
-              modelForTier: (t) => modelForTier(claudeModels([...catalog.values()]), t),
-              tierOf,
-              tiers: TIER_NAMES,
-            });
             tracking = {
               routed: true,
               model,

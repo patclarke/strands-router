@@ -44,9 +44,9 @@ const envMs = (name, fallback) => {
  * those fields have to be stripped when routing down to it.
  */
 export const TIERS = [
-  { name: "haiku", id: "claude-haiku-4-5-20251001", family: "haiku", thinking: false, effort: false },
-  { name: "sonnet", id: "claude-sonnet-5", family: "sonnet", thinking: true, effort: true },
-  { name: "opus", id: "claude-opus-5", family: "opus", thinking: true, effort: true },
+  { name: "haiku", id: "claude-haiku-5-5", family: "haiku", thinking: false, effort: false },
+  { name: "sonnet", id: "claude-sonnet-5-5", family: "sonnet", thinking: true, effort: true },
+  { name: "opus", id: "claude-opus-5-5", family: "opus", thinking: true, effort: true },
   { name: "fable", id: "claude-fable-5-1", family: "fable", thinking: true, effort: true },
 ];
 
@@ -93,16 +93,16 @@ export const THRESHOLDS = {
   downgradeMaxContextTokens: 20000,
   /**
    * Per-attempt Decider HTTP timeout and the hard wall-clock deadline for the whole routing
-   * call. Strands reports ~150ms per question warm on an M3 Pro and the state is read once
-   * for all four questions, so a warm call should land well under a second; the budget
-   * leaves room for a slower Mac or a busy GPU without ever stalling a prompt for long.
+   * call. Strands reports ~150ms per question on an M3 Pro, but the first real Mac measured
+   * 1-4s warm for one routing request, so the budget is sized for that; it only ever delays
+   * the first request of a turn, and routing gives up (keeping the current model) past it.
    */
   // Getters, because the launchers load ~/.strands-router.env after this module is imported.
   get deciderTimeoutMs() {
-    return envMs("STRANDS_DECIDER_TIMEOUT_MS", 2500);
+    return envMs("STRANDS_DECIDER_TIMEOUT_MS", 6000);
   },
   get deciderDeadlineMs() {
-    return envMs("STRANDS_DECIDER_DEADLINE_MS", 4000);
+    return envMs("STRANDS_DECIDER_DEADLINE_MS", 6500);
   },
   deciderMaxRetries: 1,
 };
@@ -190,6 +190,40 @@ export const questionForModels = (models) =>
       ]),
     ),
   );
+
+/**
+ * The compact routing question: three or four short tier options keyed by plain words, over the
+ * bare prompt. Strands Decider is a general classifier, not trained on model catalogs, and on a
+ * real Mac the detailed per-model question above answered with ~0.17 confidence, below the
+ * policy's downgrade floor, while a plain three-option question about the same prompt scored
+ * ~0.76. `scripts/decider.sh bench` compares the two on labelled prompts.
+ */
+const COMPACT_OPTIONS = {
+  haiku: ["fast", "Trivial or mechanical: typo fixes, renames, formatting, one obvious command, quick factual questions."],
+  sonnet: ["balanced", "Ordinary bounded engineering: implement a specified feature, write tests, fix a bug whose cause is known."],
+  opus: ["strong", "Hard or ambiguous: debugging an unknown cause, design across modules, security, concurrency, migrations."],
+  fable: ["long", "Very large or long-running: whole-repository changes or hours of autonomous work."],
+};
+
+export const compactQuestion = (tiers) =>
+  choice(
+    "Which model should handle this coding request? Pick the cheapest one that can do it well.",
+    Object.fromEntries(tiers.filter((t) => COMPACT_OPTIONS[t]).map((t) => COMPACT_OPTIONS[t])),
+  );
+
+/** Tier for a compact option label ("fast" -> "haiku"), or null. */
+export const tierOfCompactLabel = (label) =>
+  Object.keys(COMPACT_OPTIONS).find((t) => COMPACT_OPTIONS[t][0] === label) ?? null;
+
+/** Which question to ask: "compact" or "detailed" (STRANDS_QUESTION_STYLE). */
+export const questionStyle = () =>
+  process.env.STRANDS_QUESTION_STYLE === "detailed" ? "detailed" : "compact";
+
+/**
+ * Whether to also ask the three complexity scores shown by /strands-explain. They are not used
+ * for routing and cost latency on a Mac, so they are off unless STRANDS_DECIDER_METRICS=1.
+ */
+export const askMetrics = () => process.env.STRANDS_DECIDER_METRICS === "1";
 
 /** Whether policy accepted Decider's exact model, including a version change within one tier. */
 export const shouldUseExactModel = (reason, chosenTier, finalTier) =>
