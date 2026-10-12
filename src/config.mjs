@@ -1,5 +1,40 @@
 // Every routing decision knob lives here, so the whole policy is reviewable in one file.
-import { choice, score } from "@typesafe-ai/sdk";
+
+/**
+ * Where the local Strands Decider server listens (`strands-decider serve ... --port 8000`).
+ * Overridable for a non-default port or a decider running on another machine you own.
+ */
+export const DEFAULT_DECIDER_URL = "http://127.0.0.1:8000";
+export const deciderURL = () =>
+  (process.env.STRANDS_DECIDER_URL ?? DEFAULT_DECIDER_URL).replace(/\/+$/, "");
+
+/** System One question builders, matching the wire shapes Strands Decider validates. */
+export const score = (instructions, levels) => ({ type: "score", instructions, criteria: levels });
+export const choice = (instructions, options) => ({
+  type: "choice",
+  instructions,
+  // Decider requires each option's description to be a string (it 422s on objects), so
+  // structured guidance is flattened into one line per option.
+  criteria: Object.fromEntries(
+    Object.entries(options).map(([name, desc]) => [name, describeOption(desc)]),
+  ),
+});
+
+export function describeOption(desc) {
+  if (typeof desc === "string") return desc;
+  return Object.entries(desc ?? {})
+    .filter(([, v]) => v != null && v !== "")
+    .map(([k, v]) => {
+      const text = String(Array.isArray(v) ? v.join("; ") : v).trim();
+      return `${k.replace(/_/g, " ")}: ${/[.!?]$/.test(text) ? text : `${text}.`}`;
+    })
+    .join(" ");
+}
+
+const envMs = (name, fallback) => {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+};
 
 /**
  * Model tiers, cheapest first. `id` is what goes into the API request body; `family` is the
@@ -29,7 +64,7 @@ export const tierSpec = (name) => TIERS.find((t) => t.name === name);
  * its presence in a request is an exact signal that the user wants this turn routed. Any
  * other model means the user picked one themselves and it must be passed straight through.
  */
-export const AUTO_MODEL = "jev-router";
+export const AUTO_MODEL = "strands-router";
 
 /** Whether a request should be routed, or passed through as the user's own choice. */
 export const isAuto = (model) => model === AUTO_MODEL;
@@ -43,12 +78,12 @@ export const tierOf = (model) =>
  * subscription.
  */
 export const availableTiers = () =>
-  TIER_NAMES.filter((n) => n !== "fable" || process.env.JEV_ALLOW_FABLE === "1");
+  TIER_NAMES.filter((n) => n !== "fable" || process.env.STRANDS_ALLOW_FABLE === "1");
 
 export const THRESHOLDS = {
-  /** Below this Jev confidence we refuse to downgrade and cap upgrades at `uncertainCeiling`. */
+  /** Below this Decider confidence we refuse to downgrade and cap upgrades at `uncertainCeiling`. */
   minConfidence: 0.3,
-  /** Safest tier to land on when Jev is unsure. */
+  /** Safest tier to land on when Decider is unsure. */
   uncertainCeiling: "sonnet",
   /**
    * Switching models invalidates the prompt cache; the next turn re-sends the whole
@@ -57,13 +92,19 @@ export const THRESHOLDS = {
    */
   downgradeMaxContextTokens: 20000,
   /**
-   * Per-attempt Jev HTTP timeout and the hard wall-clock deadline for the whole routing
-   * call. Measured: ~300-350ms warm, ~900-1000ms on the first call (TLS handshake), so the
-   * deadline leaves room for one retry after a cold-start timeout.
+   * Per-attempt Decider HTTP timeout and the hard wall-clock deadline for the whole routing
+   * call. Strands reports ~150ms per question warm on an M3 Pro and the state is read once
+   * for all four questions, so a warm call should land well under a second; the budget
+   * leaves room for a slower Mac or a busy GPU without ever stalling a prompt for long.
    */
-  jevTimeoutMs: 1500,
-  jevDeadlineMs: 3000,
-  jevMaxRetries: 1,
+  // Getters, because the launchers load ~/.strands-router.env after this module is imported.
+  get deciderTimeoutMs() {
+    return envMs("STRANDS_DECIDER_TIMEOUT_MS", 2500);
+  },
+  get deciderDeadlineMs() {
+    return envMs("STRANDS_DECIDER_DEADLINE_MS", 4000);
+  },
+  deciderMaxRetries: 1,
 };
 
 export const CONTEXT_WINDOW_TOKENS = 200000;
@@ -135,7 +176,7 @@ const GUIDANCE = {
   },
 };
 
-/** Build a Jev choice from the exact models available to this account and CLI. */
+/** Build a Decider choice from the exact models available to this account and CLI. */
 export const questionForModels = (models) =>
   choice(
     [
@@ -150,6 +191,6 @@ export const questionForModels = (models) =>
     ),
   );
 
-/** Whether policy accepted Jev's exact model, including a version change within one tier. */
+/** Whether policy accepted Decider's exact model, including a version change within one tier. */
 export const shouldUseExactModel = (reason, chosenTier, finalTier) =>
-  (reason === "jev" || reason === "jev/no-change") && chosenTier === finalTier;
+  (reason === "decider" || reason === "decider/no-change") && chosenTier === finalTier;

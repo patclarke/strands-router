@@ -8,10 +8,10 @@ test("formats the last routing decision", () => {
     prompt: "Explain the router architecture",
     tier: "sonnet",
     confidence: 0.94,
-    reason: "jev",
-    jev: {
+    reason: "decider",
+    decider: {
       request: { state: { session: { current_model: "haiku", context_tokens: 6200 } } },
-      response: { answers: { model_tier: { choice: "sonnet" } } },
+      response: { answers: { model: { choice: "sonnet" } } },
     },
     metrics: {
       taskComplexity: 0.82,
@@ -28,7 +28,7 @@ test("formats the last routing decision", () => {
   assert.match(output, /Recommended tier: SONNET/);
   assert.match(output, /Selected model: SONNET/);
   assert.match(output, /Confidence: 94%/);
-  assert.match(output, /Decision: Jev recommendation/);
+  assert.match(output, /Decision: Decider's pick/);
 });
 
 test("shows the concrete provider model when available", () => {
@@ -39,6 +39,6 @@ test("shows the concrete provider model when available", () => {
 });
 
 test("Claude skill pre-approves its read-only explanation command", () => {
-  const skill = readFileSync(new URL("../.claude/skills/jev-explain/SKILL.md", import.meta.url), "utf8");
+  const skill = readFileSync(new URL("../.claude/skills/strands-explain/SKILL.md", import.meta.url), "utf8");
   assert.match(skill, /^allowed-tools: Bash\(node \*\)$/m);
 });

@@ -1,98 +1,174 @@
-# jev-router
+# strands-router
 
-Automatic per-turn model routing for Claude Code and OpenAI Codex. Jev sends simple work to
-the fast tier and difficult work to the strong tier, while preserving each CLI's native
-interface, tools, sessions, permissions, and authentication.
+Automatic per-turn model routing for Claude Code and OpenAI Codex, decided **locally** by
+[Strands Decider 2B](https://github.com/strands-labs/strands-decider) running on your Mac, with
+a ledger of the **dollars it saves**.
+
+This is a fork of [gargpratyush/jev-router](https://github.com/gargpratyush/jev-router). Instead of
+calling TypeSafe's hosted Jev model, it asks a Strands Decider server on `127.0.0.1`, so no API key
+is needed and your prompts never leave your machine for the routing decision. It also prices every
+response twice — as the model that served it, and as the model you'd have used without routing —
+so you can see exactly what routing is worth.
 
 | Command | Interface | Authentication | Routing decision |
 | --- | --- | --- | --- |
-| `jev-claude` | Claude Code | Existing `claude login` | Status line |
-| `jev-codex` | OpenAI Codex | Existing `codex login` | Commentary line |
+| `strands-claude` | Claude Code | Existing `claude login` | Status line, with session savings |
+| `strands-codex` | OpenAI Codex | Existing `codex login` | Commentary line |
+| `strands-savings` | Terminal report | — | Totals by model, CLI and day |
 
-Both commands launch the real upstream CLI. Jev only chooses the model for a fresh user turn.
+Both launchers run the real upstream CLI. The decider only chooses the model for a fresh user turn.
 
-## Quick start
+## Why this works as a drop-in for Jev
 
-Requires Node.js 20.12+ and at least one supported CLI:
-[Claude Code](https://code.claude.com/docs/en/setup) or
+Strands Decider ships an HTTP server that exposes `POST /v1/systemone`, following the public Jev
+request and response shape (`state` + named `noul` / `choice` / `score` questions in, typed
+answers with confidence out). The Strands team states that JevBench's TypeSafe adapter runs
+against it unchanged, but also that *compatibility with the Jev API itself is not verified*.
+In practice one difference mattered for this router: Decider requires each `choice` option's
+description to be a **string**, while jev-router sent objects. This fork flattens them; the
+request it builds has been validated against Decider's own pydantic schema
+(`strands_decider/schema.py`), and `test/router.test.mjs` pins that shape.
+
+## Quick start (macOS, Apple silicon)
+
+Requires Node.js 20.12+, Python 3.10+ (`brew install python@3.12`), and
+[Claude Code](https://code.claude.com/docs/en/setup) and/or
 [OpenAI Codex](https://developers.openai.com/codex/cli).
 
-### 1. npm package
+```bash
+git clone https://github.com/patclarke/strands-router.git
+cd strands-router
+npm link                         # installs strands-claude, strands-codex, strands-savings
+
+scripts/decider.sh install       # venv in ~/.strands-router/venv + pip install strands-decider
+scripts/decider.sh serve         # first run downloads the model from Hugging Face (a few GB)
+```
+
+In a second terminal:
 
 ```bash
-npm install -g jev-router
-echo "JEV_API_KEY=..." > ~/.jev-router.env
+scripts/decider.sh check         # one test question against the running server
+strands-claude                   # or: strands-codex
 ```
 
-### 2. Local repository
+To keep the decider running in the background and start it at login (launchd):
 
 ```bash
-git clone https://github.com/gargpratyush/jev-router.git
-cd jev-router
-npm install
-npm link
-echo "JEV_API_KEY=..." > ~/.jev-router.env
+scripts/decider.sh autostart     # logs: ~/.strands-router/logs/decider.log
+scripts/decider.sh stop          # remove the launchd job
 ```
 
-On Windows PowerShell:
+The server auto-detects the device (`cuda` > `mps` > `cpu`). Strands reports a warm median of
+about 150 ms per question on an M3 Pro; the router asks four questions about one prompt in a
+single call, and the state is read only once. If the decider isn't running, `strands-claude`
+says so at launch and routing fails open (the current model is kept) — usage and savings are
+still recorded.
 
-```powershell
-Set-Content "$HOME\.jev-router.env" "JEV_API_KEY=..."
-```
-
-Get a key from [TypeSafe](https://docs.typesafe.ai). Then launch either interface from any
-repository:
+No Anthropic or OpenAI API key is required when the CLI is already logged in. Every CLI argument
+is forwarded:
 
 ```bash
-jev-claude
-jev-codex
+strands-claude --resume
+strands-claude -p "fix the failing test"
+strands-codex exec "fix the failing test"
 ```
 
-No Anthropic or OpenAI API key is required when the corresponding CLI is already logged in
-with a subscription. Every CLI argument is forwarded:
+## Dollars saved
 
-```bash
-jev-claude --resume
-jev-claude -p "fix the failing test"
-jev-codex resume --last
-jev-codex exec "fix the failing test"
+Every billed response that passes through the proxy is read for its token usage (uncached input,
+5-minute and 1-hour cache writes, cache reads, output) as it streams to the CLI, then:
+
+1. **Actual cost** — priced on the model that served it (as reported by the API).
+2. **Baseline cost** — the *same tokens* priced on the model the session would have used without
+   routing.
+3. **Saved** = baseline − actual. A turn the decider routes *up* counts against the total, so the
+   figure is the net value of routing.
+
+One JSON line per response is appended to `~/.strands-router/usage.jsonl` (mode 600). It holds
+model ids, token counts and dollars only — never prompt or response text.
+
+```text
+$ strands-savings --since 7d
+Strands Router savings
+
+  Without routing (baseline)       $41.2210
+  With routing (actual)            $17.0384
+  Saved                            $24.1826  (58.7%)
+
+  212 routed turns: 131 to a cheaper model, 4 to a pricier one, 77 unchanged
+  ...
+  Served by                      Responses      Actual    Baseline       Saved
+  claude-opus-5-5                      390    $12.1100    $12.1100     $0.0000
+  claude-haiku-4-5                     544     $3.9210    $23.6100    $19.6890
+  claude-sonnet-5-5                    201     $1.0074     $5.5010     $4.4936
 ```
 
-For a local checkout, `npm link` installs both commands. Without it, run
-`node bin/jev-claude.mjs` or `node bin/jev-codex.mjs`.
+(Illustrative output.) Options: `--since 24h|7d|30d|4w|today|all`, `--session <id>`, `--json`.
+The Claude status line shows the running total for the current session:
+
+```text
+claude-haiku-4-5 (p=0.91) · saved $0.36 (75%) · my-project · 12% context
+```
+
+### What the baseline is
+
+In order of precedence:
+
+1. `STRANDS_BASELINE_MODEL` — an exact model id (`claude-opus-5-5`) or a tier (`opus`, `sonnet`).
+2. For Claude, the default model saved in `~/.claude/settings.json` before the session started.
+3. The strong tier (Opus / `gpt-5.6-sol`) — what both launchers start a routed session on.
+
+Requests where you picked a model yourself, and Claude Code's own background calls (titles,
+summaries), are recorded with zero savings: routing didn't touch them, but they're part of what
+the session cost.
+
+### Caveats — read before quoting the number
+
+- **Estimates at API list prices.** On a Claude Pro/Max or ChatGPT subscription you aren't billed
+  per token; the figure is the API-equivalent value (and a proxy for how much of your usage
+  allowance routing preserved).
+- **Same tokens, different model.** A different model would have produced a different number of
+  output tokens, and tokenizers differ between model generations. The baseline assumes the same
+  usage, which is the standard simplification but not exact.
+- **Cache effects.** Switching models invalidates the prompt cache, so a downgrade can cause cache
+  *writes* the baseline would have served as cheaper cache *reads*. The router already refuses
+  downgrades once a conversation is large (`downgradeMaxContextTokens`), and the extra writes are
+  included in the actual cost — but the baseline prices those same writes at the baseline model's
+  rate rather than as reads, so savings on a turn that switched models are somewhat overstated.
+- **Prices drift.** Rates live in `src/pricing.mjs` (Anthropic list prices as of October 2026;
+  OpenAI rates as community-reported, with sources disagreeing on `gpt-5.6-sol`). Override or add
+  any model in `~/.strands-router/pricing.json`:
+
+  ```json
+  {
+    "gpt-5.6-sol": { "input": 5, "output": 30, "cacheRead": 0.5 },
+    "gpt-6-astra": { "input": 10, "output": 60, "cacheRead": 1 }
+  }
+  ```
+
+  Values are USD per million tokens. Cache writes are billed at 1.25x (5-minute) and 2x (1-hour)
+  of `input`. Responses on a model with no known price are counted and reported as *unpriced*
+  rather than treated as free.
 
 ## Claude Code interface
 
-![Jev Router in the Claude Code model picker](docs/model-picker.png)
+`strands-claude` launches Claude Code with **Strands Router** selected in `/model`. Selecting
+another model pauses routing; selecting **Strands Router** resumes it. An existing custom
+`statusLine` is preserved; set `STRANDS_NO_STATUSLINE=1` to disable the injected one.
 
-`jev-claude` launches Claude Code with **Jev Router** selected in `/model`. Selecting another
-model pauses routing; selecting **Jev Router** resumes it.
-
-The injected status line shows the model used for the last turn:
-
-```text
-⚡ haiku p=0.98 · my-project · 8% context
-⏸ manual Opus 4.6 · my-project · 21% context
-```
-
-Claude Code otherwise remains unchanged, including its keybindings, tools, permission prompts,
-`/compact`, `/resume`, and session handling. An existing custom `statusLine` is preserved;
-set `JEV_NO_STATUSLINE=1` to disable Jev's status line.
-
-The explanation skill is bundled with the npm package and loaded automatically: run
-`/jev-explain` in `jev-claude`, or `$jev-explain` in `jev-codex`, to see the factors behind
-the last routing decision:
+Run `/strands-explain` in `strands-claude` (or `$strands-explain` in `strands-codex`) to see the
+factors behind the last routing decision, rendered locally from the saved System One exchange:
 
 ```text
 ┌─────────────────────────────────┐
-│ Jev Router                      │
+│ Strands Router                  │
 │                                 │
-│ Jev request                     │
+│ Decider request                 │
 │ Prompt: explain the router      │
 │ Current tier: HAIKU             │
 │ Context tokens: 6200            │
 │                                 │
-│ Jev response                    │
+│ Decider response                │
 │ Task complexity     0.82        │
 │ Reasoning required  0.91        │
 │ Tool complexity     0.64        │
@@ -102,179 +178,107 @@ the last routing decision:
 │ Selected model: SONNET          │
 │                                 │
 │ Confidence: 94%                 │
-│ Decision: Jev recommendation    │
+│ Decision: Decider's pick        │
 └─────────────────────────────────┘
 ```
 
-The report is rendered locally from the exact prompt, System One request, and System One
-response saved when routing occurred. Recent decisions are retained per CLI session; invoking
-the explanation skill does not ask Jev to score the prompt again.
+Up to 20 recent exchanges per CLI session are kept in `$TMPDIR/strands-claude/<session>.json`
+(mode 600; deleted after 7 days idle). They contain prompt text.
 
-### Explanation data location
-
-Both `jev-claude` and `jev-codex` keep up to 20 recent routing exchanges in one JSON file per
-CLI session under Node.js's operating-system temporary directory:
-
-| Platform | Default location |
-| --- | --- |
-| Windows | `%TEMP%\jev-claude\<session-id>.json` |
-| macOS | `$TMPDIR/jev-claude/<session-id>.json` (normally under `/var/folders/.../T`) |
-| Ubuntu/Linux | `${TMPDIR:-/tmp}/jev-claude/<session-id>.json` |
-
-Print the exact directory selected on the current machine with:
-
-```bash
-node -e "console.log(require('node:path').join(require('node:os').tmpdir(), 'jev-claude'))"
-```
-
-Claude filenames use Claude Code's session UUID. Codex filenames use
-`codex-<jev-codex-process-id>.json`. These temporary files contain prompt text and Jev's exact
-request and response, so they are readable only by you (the directory is created with mode 700 and each
-file with 600). Files not updated for 7 days are deleted automatically, and the operating system
-may also remove them during normal temporary-file cleanup.
-
-> Choosing a model with `Enter` can save it as Claude Code's default. `jev-claude` restores
-> the previous default on exit so `jev-router` cannot break plain `claude`.
+> Choosing a model with `Enter` can save it as Claude Code's default. `strands-claude` restores
+> the previous default on exit so `strands-router` cannot break plain `claude`.
 
 ## OpenAI Codex interface
 
-![Jev Router in the OpenAI Codex model picker](docs/codex-model-picker.png)
-
-`jev-codex` launches Codex with a temporary **Jev Router** provider and selects `jev-router`.
-The native `/model` picker still contains the models available to the account. Selecting a
-concrete model pauses routing; selecting **Jev Router** resumes it.
-
-Each fresh decision appears as Codex commentary:
+`strands-codex` launches Codex with a temporary **Strands Router** provider. Each fresh decision
+appears as Codex commentary:
 
 ```text
-[Jev] routed this turn to gpt-5.6-sol (jev, confidence 0.91).
+[Decider] routed this turn to gpt-5.6-luna (decider, confidence 0.91).
 ```
-
-`jev-codex` installs or refreshes the packaged `$jev-explain` skill when it starts, so it is
-available from any repository without separate setup.
-
-Codex's footer shows `jev-router` because it displays the selected picker entry,
-not the model chosen behind that provider. If Jev is unavailable, the commentary names the
-fallback model and explains how to set `JEV_API_KEY`.
 
 ## How it works
 
-Each command starts a loopback proxy, launches the real CLI, and forwards the CLI's existing
-authorization headers without reading, storing, or modifying them.
-
 ```text
-you -> Claude Code -> jev-claude proxy -> Anthropic
-                         |
-                         +-> Jev: choose a tier
+you -> Claude Code -> strands-claude proxy -> Anthropic
+                          |        |
+                          |        +-> usage -> pricing -> ~/.strands-router/usage.jsonl
+                          +-> Strands Decider @ 127.0.0.1:8000: choose a model
 
-you -> OpenAI Codex -> jev-codex proxy -> OpenAI
-                         |
-                         +-> Jev: choose a tier
+you -> OpenAI Codex -> strands-codex proxy -> OpenAI
+                          (same)
 ```
 
-Claude Code uses `ANTHROPIC_BASE_URL`; Codex uses a temporary custom provider with
-`requires_openai_auth=true`. Claude and Codex both use `jev-router` as the
-routing sentinel.
-Any concrete model selected by the user passes through unchanged.
+Each launcher starts a loopback proxy, launches the real CLI, and forwards the CLI's existing
+authorization headers without reading, storing, or modifying them. See
+[docs/strands-claude-architecture.md](docs/strands-claude-architecture.md) for the full flow.
 
 ## Routing policy
 
-One Jev call per fresh user turn selects a shared abstract tier:
+One decider call per fresh user turn picks an exact model from the account's catalog, mapped to
+a tier:
 
 | Tier | Claude Code default | Codex default |
 | --- | --- | --- |
 | Fast | Haiku | `gpt-5.6-luna` |
 | Balanced | Sonnet | `gpt-5.6-terra` |
 | Strong | Opus | `gpt-5.6-sol` |
-| Long | Fable | `gpt-6-astra` |
+| Long | Fable (opt-in) | `gpt-6-astra` (opt-in) |
 
-`src/policy.mjs` then applies these rules:
+`src/policy.mjs` then applies these rules (unchanged from jev-router):
 
 - explicit requests such as `use opus`, `use luna`, or `use strong` win;
-- failure, timeout, or an unrecognised Jev answer keeps the current model;
+- failure, timeout, or an unrecognised answer keeps the current model;
 - low confidence never downgrades and caps upgrades at the balanced tier;
 - large conversations refuse downgrades that would waste more prompt-cache work than they save;
 - unavailable tiers step upward rather than silently choosing a weaker model;
-- the long tier is disabled unless `JEV_ALLOW_FABLE=1`.
+- the long tier is disabled unless `STRANDS_ALLOW_FABLE=1`.
 
-Tool-loop continuations keep the tier chosen at the start of the turn. Main conversations and
-sub-agents are pinned separately. Routing is fail-open: Jev failure never blocks the CLI.
+Decider's confidence is calibrated (Strands reports answers at ≥ 0.9 are right ~95% of the time on
+unseen short classification tasks), but it was not trained on this routing question specifically.
+If it downgrades too eagerly for your taste, raise `THRESHOLDS.minConfidence` in `src/config.mjs`.
 
 ## Configuration
 
+Set in the environment, a `.env` in the launch directory, or `~/.strands-router.env`.
+
 | Variable | Interface | Effect |
 | --- | --- | --- |
-| `JEV_API_KEY` | Both | Enables routing. `TYPESAFE_API_KEY` also works. |
-| `JEV_ALLOW_FABLE` | Both | Enables the opt-in long tier. |
-| `JEV_DEBUG` | Both | Logs decisions and rewrites to `~/.jev-claude.log` in interactive sessions. |
-| `JEV_DUMP` | Both | Dumps request bodies for debugging wire-format changes. |
-| `JEV_NO_STATUSLINE` | Claude | Disables the injected Claude status line. |
-| `JEV_CODEX_FAST_MODEL` | Codex | Fast model; defaults to `gpt-5.6-luna`. |
-| `JEV_CODEX_BALANCED_MODEL` | Codex | Balanced model; defaults to `gpt-5.6-terra`. |
-| `JEV_CODEX_STRONG_MODEL` | Codex | Strong model; defaults to `gpt-5.6-sol`. |
-| `JEV_CODEX_LONG_MODEL` | Codex | Long model; defaults to `gpt-6-astra`. |
+| `STRANDS_DECIDER_URL` | Both | Decider server; default `http://127.0.0.1:8000`. |
+| `STRANDS_DECIDER_TIMEOUT_MS` | Both | Per-attempt timeout; default 2500. |
+| `STRANDS_DECIDER_DEADLINE_MS` | Both | Hard deadline for one routing call; default 4000. |
+| `STRANDS_BASELINE_MODEL` | Both | Model (or tier) savings are measured against. |
+| `STRANDS_HOME` | Both | Ledger, pricing overrides, venv, logs; default `~/.strands-router`. |
+| `STRANDS_DISABLE` | Both | `1` launches the CLI with no proxy at all. |
+| `STRANDS_ALLOW_FABLE` | Both | Enables the opt-in long tier. |
+| `STRANDS_DEBUG` | Both | Logs decisions, rewrites and per-response costs to `~/.strands-router.log`. |
+| `STRANDS_DUMP` | Both | Dumps request bodies for debugging wire-format changes. |
+| `STRANDS_NO_STATUSLINE` | Claude | Disables the injected status line. |
+| `STRANDS_CODEX_{FAST,BALANCED,STRONG,LONG}_MODEL` | Codex | Override the Codex tier models. |
 
-Existing environment variables have highest precedence, followed by `.env` in the launch
-directory, `~/.jev-router.env`, and the legacy `~/.jev-claude.env`.
-
-Tier definitions, Jev's question, confidence thresholds, and timeouts live in `src/config.mjs`.
-Both launchers send Jev the exact models in the signed-in account's native catalog, so model
-versions such as `claude-opus-4-8` and `claude-opus-5` remain separate choices. Static model
-ids are used only until the CLI fetches its catalog.
-
-## Compatibility notes
-
-- Claude Code needs schema normalisation for older MCP JSON Schema fields when a custom base
-  URL is active.
-- Claude request fields unsupported by a routed tier, such as adaptive thinking on Haiku,
-  are removed before forwarding.
-- Codex's current request format stores tool definitions inside its Responses API input.
-- Codex's ChatGPT backend may stream SSE without a `Content-Type` header; the proxy detects
-  the event stream from its first frame.
-- Codex workspace-specific enterprise origins are internal to its built-in provider and
-  cannot be reproduced by a custom provider.
+`scripts/decider.sh` also reads `STRANDS_DECIDER_CHECKPOINT` (default
+`StrandsAgents/strands-decider-2B-hobson-v19`, the current reference model), `STRANDS_DECIDER_PORT`
+and `STRANDS_DECIDER_DEVICE`.
 
 ## Development
 
 ```bash
-npm install
-echo "JEV_API_KEY=..." > .env
-
-npm test
-node test/live-routing.mjs
-node bin/jev-claude.mjs -p "what is 2+2?"
-node bin/jev-codex.mjs exec "what is 2+2?"
+npm test                         # no dependencies to install
+node scripts/live-routing.mjs       # needs a running decider
+node bin/strands-claude.mjs -p "what is 2+2?"
 ```
-
-The test suite covers shared policy, both request formats, model rewriting, capability
-handling, settings restoration, Codex authentication forwarding, native model-picker
-injection, and decision display.
 
 ## Limitations
 
-- The user's prompt text is sent to TypeSafe for the routing decision. Nothing else is.
-- Jev adds latency only to the first request of a turn; tool-loop continuations add none.
-- Claude Code and Codex request formats are not public contracts. Use `JEV_DUMP` to diagnose
+- Only Apple silicon Macs are practical: current PyTorch has no Intel-Mac wheels.
+- Decider adds latency to the first request of a turn only; tool-loop continuations add none.
+- To read usage, the proxy asks the API for uncompressed responses on billed requests.
+- Claude Code and Codex request formats are not public contracts. Use `STRANDS_DUMP` to diagnose
   upstream changes.
-- Developed and tested on Windows against Claude Code v2.1.101 and OpenAI Codex v0.154.0.
+- Strands Decider is an experimental 0.1.0 release; its own docs say v19 is "the reference model
+  today" and that compatibility with the Jev API is not verified.
 
-## Contributing
+## Credits and license
 
-Issues and pull requests are welcome. Use [Issues](https://github.com/gargpratyush/jev-router/issues)
-to report bugs, request improvements, or ask questions. Include the relevant Claude Code or
-Codex version, reproduction steps, expected behavior, and useful logs with secrets removed.
-
-For a pull request:
-
-1. Open an issue first - all PRs by contributors should be linked with an approved issue. Explain the problem and validation in the issue description.
-2. Fork the repository and create a focused branch from `master`.
-3. Make the smallest change that solves the problem.
-4. Run `npm test` and include tests for non-trivial behavior changes.
-5. Claude/Copilot/Codex shall not be the contributors. 
-
-Please do not commit API keys or other secrets. All contributions require review, and only the
-repository owner can merge pull requests.
-
-## License
-
-MIT
+Routing proxy, policy and CLI integration by the [jev-router](https://github.com/gargpratyush/jev-router)
+contributors (MIT). Strands Decider by AWS Strands Labs (Apache-2.0). This fork is MIT.

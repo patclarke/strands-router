@@ -1,3 +1,5 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -12,19 +14,22 @@ import {
 } from "../src/proxy.mjs";
 
 test("only the sentinel model is routed", () => {
-  assert.equal(isAuto("jev-router"), true);
+  assert.equal(isAuto("strands-router"), true);
   assert.equal(isAuto("claude-opus-4-6"), false, "a model the user picked is theirs");
   assert.equal(isAuto("claude-haiku-4-5-20251001"), false, "internal Haiku calls pass through");
   assert.equal(isAuto(undefined), false);
 });
 
 test("the sentinel is not mistaken for a real tier", () => {
-  assert.equal(tierOf("jev-router"), null);
+  assert.equal(tierOf("strands-router"), null);
 });
 import { tierOf, isAuto } from "../src/config.mjs";
 import { writeDecision, writeStatus, readStatus, pruneStale, STATUS_DIR } from "../src/status.mjs";
 import { mkdirSync, statSync, utimesSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+
+// Keep the savings ledger these proxies write out of the real home directory.
+process.env.STRANDS_HOME = mkdtempSync(join(tmpdir(), "strands-test-"));
 
 test("reads the session id out of Claude Code's metadata", () => {
   const sid = "11111111-2222-4333-8444-555555555555";
@@ -35,8 +40,8 @@ test("reads the session id out of Claude Code's metadata", () => {
 
 test("status round-trips per session and misses cleanly", () => {
   const sid = `test-${process.pid}`;
-  writeStatus(sid, { tier: "opus", confidence: 0.87, reason: "jev" });
-  assert.deepEqual(readStatus(sid), { tier: "opus", confidence: 0.87, reason: "jev" });
+  writeStatus(sid, { tier: "opus", confidence: 0.87, reason: "decider" });
+  assert.deepEqual(readStatus(sid), { tier: "opus", confidence: 0.87, reason: "decider" });
   assert.equal(readStatus("no-such-session"), null);
   assert.doesNotThrow(() => writeStatus("", { tier: "opus" }));
 });
@@ -61,14 +66,14 @@ test("stale status files are pruned and fresh ones kept", () => {
   assert.equal(existsSync(fresh), true);
 });
 
-test("routing status retains the exact recent Jev exchanges", () => {
+test("routing status retains the exact recent Decider exchanges", () => {
   const sid = `history-${process.pid}`;
-  writeDecision(sid, { prompt: "first", jev: { request: { id: 1 }, response: { confidence: 0.6 } } });
-  writeDecision(sid, { prompt: "second", jev: { request: { id: 2 }, response: { confidence: 0.8 } } });
+  writeDecision(sid, { prompt: "first", decider: { request: { id: 1 }, response: { confidence: 0.6 } } });
+  writeDecision(sid, { prompt: "second", decider: { request: { id: 2 }, response: { confidence: 0.8 } } });
   const status = readStatus(sid);
   assert.equal(status.prompt, "second");
   assert.deepEqual(status.history.map(({ prompt }) => prompt), ["first", "second"]);
-  assert.equal(status.history[0].jev.response.confidence, 0.6);
+  assert.equal(status.history[0].decider.response.confidence, 0.6);
 });
 
 test("recognises older model versions within a tier", () => {
@@ -81,7 +86,7 @@ test("recognises older model versions within a tier", () => {
   assert.equal(tierOf(undefined), null);
 });
 
-test("keeps available Claude model versions as separate Jev choices", () => {
+test("keeps available Claude model versions as separate Decider choices", () => {
   assert.deepEqual(
     claudeModels([
       { id: "claude-opus-5", display_name: "Claude Opus 5" },
@@ -94,7 +99,7 @@ test("keeps available Claude model versions as separate Jev choices", () => {
   );
 });
 
-test("Claude proxy sends exact account models to Jev and routes the chosen version", async (t) => {
+test("Claude proxy sends exact account models to Decider and routes the chosen version", async (t) => {
   const seen = [];
   const upstream = http.createServer((req, res) => {
     const chunks = [];
@@ -136,7 +141,7 @@ test("Claude proxy sends exact account models to Jev and routes the chosen versi
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      model: "jev-router",
+      model: "strands-router",
       tools: [{ name: "Bash" }],
       messages: [{ role: "user", content: "debug this race" }],
     }),
@@ -164,7 +169,7 @@ test("a routed request without metadata is recorded under the conversation key",
 
   // Exactly what `claude -p` sends first: no metadata, so no session id.
   const body = {
-    model: "jev-router",
+    model: "strands-router",
     tools: [{ name: "Bash" }],
     messages: [{ role: "user", content: `rename this variable ${process.pid}` }],
   };

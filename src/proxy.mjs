@@ -4,20 +4,24 @@ import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import {
   TIERS,
+  TIER_NAMES,
   tierOf,
   idOf,
+  rankOf,
   availableTiers,
   tierSpec,
   isAuto,
   shouldUseExactModel,
 } from "./config.mjs";
-import { askJev } from "./router.mjs";
+import { directionOf, resolveBaseline, trackResponse } from "./accounting.mjs";
+import { appendEntry } from "./ledger.mjs";
+import { askDecider } from "./router.mjs";
 import { decide } from "./policy.mjs";
 import { log } from "./log.mjs";
 import { writeDecision, writeStatus } from "./status.mjs";
 
 const ANTHROPIC_BASE_URL = "https://api.anthropic.com";
-const debug = (line) => process.env.JEV_DEBUG && log(line);
+const debug = (line) => process.env.STRANDS_DEBUG && log(line);
 
 /**
  * Claude Code converts draft-04 relics in MCP tool schemas before sending them first-party,
@@ -48,9 +52,9 @@ export function sanitizeSchema(node) {
  *
  * A turn can continue for many requests while Claude works through tool calls, and those
  * continuations end in a `tool_result` rather than typed text. Routing them would re-ask
- * Jev on every tool call and let the model flip mid-task, so only the opening request of a
+ * Decider on every tool call and let the model flip mid-task, so only the opening request of a
  * turn counts. Claude Code also injects `<system-reminder>` blocks into the user message,
- * which are noise to a router and measurably blunt Jev's confidence, so they are removed.
+ * which are noise to a router and measurably blunt Decider's confidence, so they are removed.
  */
 export function newTurnPrompt(body) {
   if (!Array.isArray(body?.tools) || body.tools.length === 0) return null; // auxiliary call
@@ -167,7 +171,15 @@ export function observeModel(state, current) {
 }
 
 
-export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = askJev } = {}) {
+/** Billed message requests; token counting and model listing cost nothing. */
+const isBilled = (method, url = "") => method === "POST" && /^\/v1\/messages(?:\?|$)/.test(url);
+
+export async function startProxy({
+  upstreamURL = ANTHROPIC_BASE_URL,
+  route = askDecider,
+  baselineModel,
+  record = appendEntry,
+} = {}) {
   // Tier routed for each conversation's turn in flight, reused by its follow-up requests and
   // by the cache-rebuild guard, which needs to know what the prompt cache was built on.
   const convos = new Map();
@@ -189,13 +201,15 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
     req.on("data", (c) => chunks.push(c));
     req.on("end", async () => {
       let out = Buffer.concat(chunks);
+      // What to bill this response as, filled in once the request body is understood.
+      let tracking = null;
 
       if (/^\/v1\/messages/.test(req.url ?? "")) {
         try {
           const body = JSON.parse(out.toString());
-          // Claude Code's request shape is undocumented and moves; JEV_DUMP captures it.
-          if (process.env.JEV_DUMP) {
-            writeFileSync(`${process.env.JEV_DUMP}.${Date.now()}.json`, JSON.stringify(body, null, 2));
+          // Claude Code's request shape is undocumented and moves; STRANDS_DUMP captures it.
+          if (process.env.STRANDS_DUMP) {
+            writeFileSync(`${process.env.STRANDS_DUMP}.${Date.now()}.json`, JSON.stringify(body, null, 2));
           }
           body.tools?.forEach((t) => sanitizeSchema(t.input_schema));
 
@@ -209,13 +223,14 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
             if (Array.isArray(body.tools)) {
               writeStatus(sessionOf(body), { manual: true, at: Date.now() });
             }
+            tracking = { routed: false, model: body.model, session: sessionOf(body) || conversationKey(body) };
           } else {
             const key = conversationKey(body);
             const state = stateFor(key);
             // What the prompt cache was built on, which is what a downgrade would discard.
             const current = state.tier ?? "opus";
             const prompt = newTurnPrompt(body);
-            const explaining = prompt?.includes("<jev-explain>");
+            const explaining = prompt?.includes("<strands-explain>");
             let fresh = null;
             if (prompt && !explaining) {
               const models = claudeModels([...catalog.values()]).filter((model) =>
@@ -224,12 +239,12 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
               const available = [...new Set(models.map((model) => model.tier))];
               const currentModel = state.model ?? modelForTier(models, current);
               const contextTokens = Math.round(JSON.stringify(body.messages).length / 4);
-              const jev = await route({ prompt, current: currentModel, contextTokens, models });
-              const chosen = models.find((model) => model.id === jev?.choice);
-              const tierAnswer = jev && { ...jev, choice: chosen?.tier };
+              const decider = await route({ prompt, current: currentModel, contextTokens, models });
+              const chosen = models.find((model) => model.id === decider?.choice);
+              const tierAnswer = decider && { ...decider, choice: chosen?.tier };
               const { tier, reason } = decide({
                 prompt,
-                jev: tierAnswer,
+                decider: tierAnswer,
                 current,
                 available,
                 contextTokens,
@@ -242,16 +257,18 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
                     : modelForTier(models, tier);
               state.tier = tier;
               state.model = model;
+              state.reason = reason;
               fresh = {
                 prompt,
                 model,
-                confidence: jev?.confidence ?? null,
-                metrics: jev?.metrics ?? null,
+                confidence: decider?.confidence ?? null,
+                metrics: decider?.metrics ?? null,
                 reason,
-                jev: jev ? { request: jev.request, response: jev.response } : null,
+                ms: decider?.ms ?? null,
+                decider: decider ? { request: decider.request, response: decider.response } : null,
               };
               debug(
-                `${key} ${jev ? `${jev.ms}ms p=${jev.confidence.toFixed(2)}` : "no-jev"} ` +
+                `${key} ${decider ? `${decider.ms}ms p=${decider.confidence.toFixed(2)}` : "no-decider"} ` +
                   `${current} -> ${tier} (${reason}) ctx~${contextTokens} | ${prompt.slice(0, 60)}`,
               );
             }
@@ -266,10 +283,26 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
             // `claude -p` omits metadata on the first request of a session, so there is no
             // session id to file the decision under and it would be dropped. The conversation
             // key is stable for the same conversation and is already what `debug` prints, so
-            // it is the identifier a user can pass to `jev-explain` for a print-mode run.
+            // it is the identifier a user can pass to `strands-explain` for a print-mode run.
             if (fresh && !explaining) {
               writeDecision(sessionOf(body) || key, { tier, ...fresh, at: Date.now() });
             }
+            const baseline = resolveBaseline({
+              saved: baselineModel,
+              modelForTier: (t) => modelForTier(claudeModels([...catalog.values()]), t),
+              tierOf,
+              tiers: TIER_NAMES,
+            });
+            tracking = {
+              routed: true,
+              model,
+              baseline,
+              session: sessionOf(body) || key,
+              reason: state.reason ?? null,
+              turn: Boolean(fresh),
+              direction: fresh ? directionOf(rankOf, tier, tierOf(baseline)) : null,
+              deciderMs: fresh?.ms ?? null,
+            };
           }
           out = Buffer.from(JSON.stringify(body));
         } catch (err) {
@@ -284,9 +317,13 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
       if (req.method === "GET" && /^\/v1\/models(?:\?|$)/.test(req.url ?? "")) {
         delete headers["accept-encoding"];
       }
-      // Under JEV_DEBUG, ask for an uncompressed stream so the model the API reports can be
+      // Under STRANDS_DEBUG, ask for an uncompressed stream so the model the API reports can be
       // read back out of it. Not worth the bandwidth cost in normal operation.
-      if (process.env.JEV_DEBUG) delete headers["accept-encoding"];
+      if (process.env.STRANDS_DEBUG) delete headers["accept-encoding"];
+      // Usage is read from the response as it streams past, which needs it uncompressed.
+      // Message bodies are mostly small SSE frames, so the bandwidth cost is slight.
+      if (!isBilled(req.method, req.url)) tracking = null;
+      if (tracking) delete headers["accept-encoding"];
       const upstream = transport.request(
         {
           hostname: target.hostname,
@@ -317,10 +354,22 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
             return;
           }
           res.writeHead(up.statusCode, up.headers);
+          const encoding = up.headers["content-encoding"];
+          if (
+            tracking &&
+            up.statusCode >= 200 &&
+            up.statusCode < 300 &&
+            (!encoding || encoding === "identity")
+          ) {
+            const tracker = trackResponse({ cli: "claude", provider: "anthropic", record, ...tracking });
+            up.on("data", (chunk) => tracker.write(chunk));
+            up.on("end", () => tracker.end());
+            up.on("aborted", () => tracker.end());
+          }
           // Report the model the API itself says it used, so the routing can be confirmed
           // from the wire rather than trusted from our own decision log. Claude Code's UI
           // always shows the model it asked for, never the one we rewrote to.
-          if (process.env.JEV_DEBUG) {
+          if (process.env.STRANDS_DEBUG) {
             let seen = false;
             up.on("data", (c) => {
               if (seen) return;

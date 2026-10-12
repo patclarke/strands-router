@@ -23,18 +23,18 @@ function clampToAvailable(tier, available) {
 }
 
 /**
- * Turns a Jev answer into the model we will actually run. Pure and total: any missing,
+ * Turns a Decider answer into the model we will actually run. Pure and total: any missing,
  * malformed, or unavailable input falls back to the model already in use.
  *
  * @param {object} input
  * @param {string} input.prompt        raw user prompt, for explicit-override detection
- * @param {?{choice: string, confidence: number}} input.jev  null when Jev failed
+ * @param {?{choice: string, confidence: number}} input.decider  null when Decider failed
  * @param {string} input.current       tier currently active in the session
  * @param {string[]} input.available   tier names the account can run
  * @param {number} input.contextTokens approximate size of the conversation so far
  * @returns {{tier: string, reason: string, changed: boolean}}
  */
-export function decide({ prompt, jev, current, available, contextTokens = 0 }) {
+export function decide({ prompt, decider, current, available, contextTokens = 0 }) {
   const settle = (tier, reason) => {
     const final = clampToAvailable(tier, available) ?? current;
     const why = final === tier ? reason : `${reason}+unavailable`;
@@ -44,11 +44,11 @@ export function decide({ prompt, jev, current, available, contextTokens = 0 }) {
   const override = detectOverride(prompt);
   if (override) return settle(override, "override");
 
-  if (!jev || !TIER_NAMES.includes(jev.choice)) return settle(current, "jev-unavailable");
+  if (!decider || !TIER_NAMES.includes(decider.choice)) return settle(current, "decider-unavailable");
 
-  let target = jev.choice;
+  let target = decider.choice;
 
-  if (jev.confidence < THRESHOLDS.minConfidence) {
+  if (decider.confidence < THRESHOLDS.minConfidence) {
     if (rankOf(target) < rankOf(current)) return settle(current, "low-confidence-no-downgrade");
     const ceiling = Math.max(rankOf(current), rankOf(THRESHOLDS.uncertainCeiling));
     if (rankOf(target) > ceiling) return settle(TIER_NAMES[ceiling], "low-confidence-capped");
@@ -58,5 +58,5 @@ export function decide({ prompt, jev, current, available, contextTokens = 0 }) {
     return settle(current, "downgrade-not-worth-cache-rebuild");
   }
 
-  return settle(target, "jev");
+  return settle(target, "decider");
 }

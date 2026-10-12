@@ -2,7 +2,7 @@ import { appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const LOG_FILE = join(homedir(), ".jev-claude.log");
+export const LOG_FILE = join(homedir(), ".strands-router.log");
 
 // Claude Code owns the terminal in interactive mode and redraws over anything we print, so
 // writing to stderr there corrupts its UI. Log to a file instead and leave stderr alone.
@@ -10,7 +10,7 @@ export const LOG_FILE = join(homedir(), ".jev-claude.log");
 const interactive = process.stdout.isTTY;
 
 export function log(line) {
-  const text = `[jev] ${line}\n`;
+  const text = `[strands] ${line}\n`;
   if (!interactive) return void process.stderr.write(text);
   try {
     appendFileSync(LOG_FILE, `${new Date().toISOString()} ${text}`);
@@ -19,4 +19,4 @@ export function log(line) {
   }
 }
 
-export const debug = (line) => process.env.JEV_DEBUG && log(line);
+export const debug = (line) => process.env.STRANDS_DEBUG && log(line);
