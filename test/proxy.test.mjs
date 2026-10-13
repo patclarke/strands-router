@@ -6,6 +6,7 @@ import http from "node:http";
 import {
   sanitizeSchema,
   newTurnPrompt,
+  hintsOf,
   applyTier,
   claudeModels,
   conversationKey,
@@ -443,4 +444,97 @@ test("an exact saved default is the model a session starts on, with any [1m] ali
     body: JSON.stringify({ model: "strands-router", messages: [{ role: "user", content: `title ${process.pid}` }] }),
   });
   assert.equal(seen[0].model, "claude-opus-4-6");
+});
+
+// Gateway hint headers (https://code.claude.com/docs/en/llm-gateway-protocol#gateway-hint-headers)
+
+test("hint headers are read when present and null otherwise", () => {
+  assert.deepEqual(hintsOf({ "x-claude-code-request-class": "main", "x-claude-code-prompt-id": "p1" }), {
+    requestClass: "main",
+    promptId: "p1",
+  });
+  assert.deepEqual(hintsOf({}), { requestClass: null, promptId: null });
+  assert.deepEqual(hintsOf({ "x-claude-code-prompt-id": "" }), { requestClass: null, promptId: null });
+});
+
+test("labelled compaction and auxiliary requests never start a turn", () => {
+  const body = withTools([{ role: "user", content: "summarise the conversation so far" }]);
+  for (const requestClass of ["compaction", "auxiliary"]) {
+    assert.equal(newTurnPrompt(body, { requestClass, promptId: "p1" }), null, requestClass);
+    assert.equal(newTurnPrompt(body, { requestClass, promptId: null }), null, requestClass);
+  }
+});
+
+test("with a prompt id, a turn starts exactly when the id changes", () => {
+  const typed = withTools([{ role: "user", content: "fix the typo" }]);
+  const hints = { requestClass: "main", promptId: "p2" };
+  assert.equal(newTurnPrompt(typed, hints, "p1"), "fix the typo", "new id: a new turn");
+  assert.equal(newTurnPrompt(typed, hints, "p2"), null, "same id: a continuation, however the body looks");
+  // The id decides, not the body's shape: no tools, a trailing system message, and a tool result
+  // alongside the typed text would each have fooled the body heuristic.
+  const odd = {
+    messages: [
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "ok" }, { type: "text", text: "now rename it" }] },
+      { role: "system", content: "reminder" },
+    ],
+  };
+  assert.equal(newTurnPrompt(odd, hints, "p1"), "now rename it");
+});
+
+test("a subagent's first request is its own turn", () => {
+  const body = withTools([{ role: "user", content: "search the repo for TODOs" }]);
+  assert.equal(newTurnPrompt(body, { requestClass: "subagent", promptId: "p1" }, null), "search the repo for TODOs");
+});
+
+test("without a prompt id the body heuristic still applies", () => {
+  const continuation = withTools([
+    { role: "user", content: "go" },
+    { role: "assistant", content: [{ type: "tool_use", id: "t", name: "Bash", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "ok" }] },
+  ]);
+  assert.equal(newTurnPrompt(continuation, { requestClass: "main", promptId: null }), null);
+  assert.equal(newTurnPrompt(continuation, {}), null);
+  assert.equal(newTurnPrompt(withTools([{ role: "user", content: "hi" }]), {}), "hi");
+});
+
+test("the proxy asks the decider once per prompt id, and never for auxiliary requests", async (t) => {
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      res.end('{"id":"msg_1","type":"message"}');
+    });
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => upstream.close());
+  const asked = [];
+  const { port, close } = await startProxy({
+    upstreamURL: `http://127.0.0.1:${upstream.address().port}`,
+    record: () => {},
+    route: async ({ prompt }) => {
+      asked.push(prompt);
+      return null;
+    },
+  });
+  t.after(close);
+  const first = { role: "user", content: `first prompt ${process.pid}` };
+  const send = (requestClass, promptId, messages) =>
+    fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-claude-code-request-class": requestClass,
+        ...(promptId ? { "x-claude-code-prompt-id": promptId } : {}),
+      },
+      body: JSON.stringify({ model: "strands-router", ...withTools(messages) }),
+    }).then((r) => r.text());
+
+  await send("main", "p1", [first]);
+  // Tool-loop continuations of the same prompt, one of them shaped like a fresh prompt.
+  await send("main", "p1", [first, { role: "assistant", content: "ok" }, { role: "user", content: "looks new" }]);
+  await send("main", "p1", [first]);
+  await send("auxiliary", "p1", [first]);
+  await send("main", "p2", [first, { role: "assistant", content: "done" }, { role: "user", content: "second prompt" }]);
+
+  assert.deepEqual(asked, [`first prompt ${process.pid}`, "second prompt"]);
 });

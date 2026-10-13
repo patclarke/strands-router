@@ -48,25 +48,42 @@ export function sanitizeSchema(node) {
 }
 
 /**
- * The text of a genuinely new user turn, or null.
- *
- * A turn can continue for many requests while Claude works through tool calls, and those
- * continuations end in a `tool_result` rather than typed text. Routing them would re-ask
- * Decider on every tool call and let the model flip mid-task, so only the opening request of a
- * turn counts. Claude Code also injects `<system-reminder>` blocks into the user message,
- * which are noise to a router and measurably blunt Decider's confidence, so they are removed.
+ * Claude Code's gateway hint headers, which label each request so a router doesn't have to
+ * infer it from the body. Sent behind a custom base URL only with
+ * CLAUDE_CODE_GATEWAY_HINT_HEADERS=1, which strands-claude sets. `requestClass` is `main`,
+ * `subagent`, `workflow`, `compaction` or `auxiliary` (v2.1.273+); `promptId` is shared by every
+ * request serving one user prompt, its subagents included (v2.1.283+). Either may be null.
+ * https://code.claude.com/docs/en/llm-gateway-protocol#gateway-hint-headers
  */
-export function newTurnPrompt(body) {
-  if (!Array.isArray(body?.tools) || body.tools.length === 0) return null; // auxiliary call
-  // Newer Claude Code versions append mid-conversation system messages (reminders) after the
-  // user's message, so the turn is decided by the last message that isn't one of those.
+export function hintsOf(headers = {}) {
+  const value = (name) => {
+    const v = headers[name];
+    return typeof v === "string" && v ? v : null;
+  };
+  return {
+    requestClass: value("x-claude-code-request-class"),
+    promptId: value("x-claude-code-prompt-id"),
+  };
+}
+
+/** Requests that never start a turn: conversation summaries, and titles and classifiers. */
+const NEVER_A_TURN = new Set(["compaction", "auxiliary"]);
+
+/**
+ * Text the user typed in the latest message, skipping trailing mid-conversation system messages
+ * (newer Claude Code appends reminders after the prompt). Claude Code also injects
+ * `<system-reminder>` blocks into the user message, which are noise to a router and measurably
+ * blunt the decider's confidence, so they are removed. Null when there is no typed text, or when
+ * `toolResults` is "reject" and the message carries tool results.
+ */
+function userText(body, { toolResults = "reject" } = {}) {
   const last = body?.messages?.findLast((message) => message?.role !== "system");
   if (!last || last.role !== "user") return null;
   let text;
   if (typeof last.content === "string") {
     text = last.content;
   } else if (Array.isArray(last.content)) {
-    if (last.content.some((b) => b.type === "tool_result")) return null;
+    if (toolResults === "reject" && last.content.some((b) => b.type === "tool_result")) return null;
     text = last.content
       .filter((b) => b.type === "text")
       .map((b) => b.text)
@@ -75,6 +92,29 @@ export function newTurnPrompt(body) {
     return null;
   }
   return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim() || null;
+}
+
+/**
+ * The text of a genuinely new user turn, or null.
+ *
+ * A turn can continue for many requests while Claude works through tool calls. Routing those
+ * would re-ask the decider on every tool call and let the model flip mid-task, so only the
+ * opening request of a turn counts.
+ *
+ * With hint headers this is exact: labelled compaction and auxiliary requests never count, and
+ * with a prompt id a turn starts precisely when the id differs from `lastPromptId`, the one last
+ * seen in this conversation. Without them (older Claude Code, or hints turned off) it falls back
+ * to reading the body: auxiliary calls carry no tools, and tool-loop continuations end in a
+ * `tool_result` rather than typed text.
+ */
+export function newTurnPrompt(body, hints = {}, lastPromptId = null) {
+  if (NEVER_A_TURN.has(hints.requestClass)) return null;
+  if (hints.requestClass && hints.promptId) {
+    if (hints.promptId === lastPromptId) return null;
+    return userText(body, { toolResults: "ignore" });
+  }
+  if (!Array.isArray(body?.tools) || body.tools.length === 0) return null; // auxiliary call
+  return userText(body);
 }
 
 /**
@@ -246,7 +286,11 @@ export async function startProxy({
                 : modelForTier(claudeModels([...catalog.values()]), tier);
             // What the prompt cache was built on, which is what a downgrade would discard.
             const current = state.tier ?? startTier;
-            const prompt = newTurnPrompt(body);
+            const hints = hintsOf(req.headers);
+            const prompt = newTurnPrompt(body, hints, state.promptId);
+            // Remember which prompt this conversation is serving, so its follow-up requests
+            // (tool calls, retries) reuse the turn's decision instead of asking again.
+            if (hints.promptId && !NEVER_A_TURN.has(hints.requestClass)) state.promptId = hints.promptId;
             const explaining = prompt?.includes("<strands-explain>");
             let fresh = null;
             if (prompt && !explaining) {
@@ -286,7 +330,8 @@ export async function startProxy({
               };
               debug(
                 `${key} ${decider ? `${decider.ms}ms p=${decider.confidence.toFixed(2)}` : "no-decider"} ` +
-                  `${current} -> ${tier} (${reason}) ctx~${contextTokens} | ${prompt.slice(0, 60)}`,
+                  `${current} -> ${tier} (${reason}) ctx~${contextTokens} ` +
+                  `turn:${hints.promptId ? "hints" : "body"} | ${prompt.slice(0, 60)}`,
               );
             }
             // The sentinel is not a real model, so every routed request must be rewritten,

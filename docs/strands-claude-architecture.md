@@ -14,7 +14,7 @@ flowchart TB
     disabled -- Yes --> direct["Spawn real Claude Code\nwithout routing"]
     disabled -- No --> health["GET /health on the local Decider\nwarn if down; send one warm-up question"]
     health --> proxyStart["Start ephemeral loopback proxy\n127.0.0.1:random-port"]
-    proxyStart --> launchEnv["Set ANTHROPIC_BASE_URL to proxy\nExpose `strands-router` as Strands Router in /model\nDefault to `strands-router` unless user set ANTHROPIC_MODEL"]
+    proxyStart --> launchEnv["Set ANTHROPIC_BASE_URL to proxy\nExpose `strands-router` as Strands Router in /model\nDefault to `strands-router` unless user set ANTHROPIC_MODEL\nTurn on gateway hint headers"]
     launchEnv --> statusCfg{"Status line allowed?"}
     statusCfg -- "No: STRANDS_NO_STATUSLINE or user statusLine" --> spawn
     statusCfg -- Yes --> statusCfgFile["Write temporary Claude status-line settings"] --> spawn
@@ -38,7 +38,7 @@ flowchart TB
 
     mode -- No --> pass["Leave model unchanged\nFor agent requests, publish manual status"]
     mode -- Yes --> conversation["Build conversation key\nsession ID + first-message text\nKeep up to 50 independent states"]
-    conversation --> fresh{"Fresh user turn?\n(tool-bearing, last user text,\nnot a tool-result continuation)"}
+    conversation --> fresh{"Fresh user turn?\nhint headers: not compaction/auxiliary,\nprompt id changed\nfallback: tool-bearing, last user text,\nnot a tool-result continuation"}
     fresh -- No --> pinned["Reuse tier pinned for this conversation\n(default: opus)"]
     fresh -- Yes --> prompt["Remove system-reminder blocks\nEstimate context tokens"]
     prompt --> decider

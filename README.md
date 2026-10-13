@@ -310,6 +310,29 @@ Decider's confidence is calibrated (Strands reports answers at ≥ 0.9 are right
 unseen short classification tasks), but it was not trained on this routing question specifically.
 If it downgrades too eagerly for your taste, raise `THRESHOLDS.minConfidence` in `src/config.mjs`.
 
+### How a turn is detected
+
+The decider is asked once per user prompt, not on every request. One prompt can produce dozens of
+requests while Claude works through tool calls, and re-routing each of them would let the model
+flip mid-task. So the proxy has to know which request starts a turn.
+
+`strands-claude` turns on Claude Code's
+[gateway hint headers](https://code.claude.com/docs/en/llm-gateway-protocol#gateway-hint-headers)
+(`CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`), so Claude Code labels every request itself:
+
+| Header | Used for | Needs Claude Code |
+| --- | --- | --- |
+| `x-claude-code-request-class` | `compaction` (conversation summaries) and `auxiliary` (titles, classifiers) never start a turn | v2.1.273+ |
+| `x-claude-code-prompt-id` | A turn starts exactly when the prompt id changes; every request for the same prompt, subagents included, reuses that turn's model | v2.1.283+ |
+
+The headers carry labels and a random id, never prompt text. Without them (an older Claude Code,
+or `CLAUDE_CODE_GATEWAY_HINT_HEADERS=0`) the proxy falls back to reading the request body: calls
+with no tools are auxiliary, and a last message holding tool results is a continuation. That
+fallback depends on Claude Code's request shape, which isn't a public contract and has broken
+before ([#1](https://github.com/patclarke/strands-router/issues/1)). With `STRANDS_DEBUG=1`, each
+decision in `~/.strands-router.log` ends in `turn:hints` or `turn:body` to show which path decided
+it.
+
 ### Question style
 
 Decider is a general classifier, so how the question is phrased matters a lot. Two styles are
@@ -343,6 +366,7 @@ Set in the environment, a `.env` in the launch directory, or `~/.strands-router.
 | `STRANDS_DEBUG` | Both | Logs decisions, rewrites and per-response costs to `~/.strands-router.log`. |
 | `STRANDS_DUMP` | Both | Dumps request bodies for debugging wire-format changes. |
 | `STRANDS_NO_STATUSLINE` | Claude | Disables the injected status line. |
+| `CLAUDE_CODE_GATEWAY_HINT_HEADERS` | Claude | Set to `1` by `strands-claude` so turns are detected from headers; `0` falls back to body parsing. See [How a turn is detected](#how-a-turn-is-detected). |
 | `STRANDS_CODEX_{FAST,BALANCED,STRONG,LONG}_MODEL` | Codex | Override the Codex tier models. |
 
 `scripts/decider.sh` also reads `STRANDS_DECIDER_CHECKPOINT` (default
@@ -384,8 +408,9 @@ This is the same whichever decider is used (Strands Decider, Jev or Clef).
   router's sentinel model id isn't one it knows. It's harmless.
 - Decider adds latency to the first request of a turn only; tool-loop continuations add none.
 - To read usage, the proxy asks the API for uncompressed responses on billed requests.
-- Claude Code and Codex request formats are not public contracts. Use `STRANDS_DUMP` to diagnose
-  upstream changes.
+- Claude Code and Codex request formats are not public contracts. Claude turns are detected from
+  Claude Code's hint headers where available, so this mostly affects Codex and older Claude Code.
+  Use `STRANDS_DUMP` to diagnose upstream changes.
 - Strands Decider is an experimental 0.1.0 release; its own docs say v19 is "the reference model
   today" and that compatibility with the Jev API is not verified.
 
