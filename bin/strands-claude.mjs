@@ -34,6 +34,12 @@ function autoModelEnv() {
   // ANTHROPIC_MODEL applies to this session only and is never written to settings, so the
   // default costs the user nothing permanent. A model they set themselves still wins.
   if (!process.env.ANTHROPIC_MODEL) env.ANTHROPIC_MODEL = AUTO_MODEL;
+  // Have Claude Code label each request (main turn, subagent, compaction, title...) and tag the
+  // prompt it serves, so the proxy detects turns from headers rather than the body's shape.
+  // Behind a custom base URL these are off by default; a value the user set still wins.
+  if (process.env.CLAUDE_CODE_GATEWAY_HINT_HEADERS === undefined) {
+    env.CLAUDE_CODE_GATEWAY_HINT_HEADERS = "1";
+  }
   return env;
 }
 
